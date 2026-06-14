@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": true,
+  "score": 0.0005643762350789734,
+  "fail_reason": null,
+  "sizes": [
+    {
+      "label": "uniform_N4K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.04499739583297924,
+      "achieved": 0.1208845067432396,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.0006044225337161979
+    },
+    {
+      "label": "uniform_N16K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.1887531249994936,
+      "achieved": 0.11527200940412707,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.0005763600470206354
+    },
+    {
+      "label": "uniform_N64K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.8432888750012353,
+      "achieved": 0.1032052130414652,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.000516026065207326
+    }
+  ]
+}

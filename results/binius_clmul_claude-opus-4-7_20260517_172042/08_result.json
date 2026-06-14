@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": true,
+  "score": 0.16311056561122353,
+  "fail_reason": null,
+  "sizes": [
+    {
+      "label": "gf128_N64K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00034208333272545133,
+      "achieved": 49.044236871560855,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 577.4018126603683,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.08493952702640546
+    },
+    {
+      "label": "gf128_N256K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0007695000003877794,
+      "achieved": 87.21099930627858,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 577.4018126603683,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.1510403975083755
+    },
+    {
+      "label": "gf128_N1M",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0013744166662945645,
+      "achieved": 195.30864444746845,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 577.4018126603683,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.3382542973801683
+    }
+  ]
+}

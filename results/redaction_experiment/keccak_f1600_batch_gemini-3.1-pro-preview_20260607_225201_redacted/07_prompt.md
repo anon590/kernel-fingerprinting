@@ -1,0 +1,672 @@
+## Task: keccak_f1600_batch
+
+Batched Keccak-f[1600] sponge over fixed-length messages. Each of ``batch`` independent instances absorbs ``msg_bytes`` bytes of input, applies the standard FIPS 202 padding, runs the 24-round Keccak-f[1600] permutation, and squeezes ``out_bytes`` bytes of output. All test sizes satisfy ``msg_bytes < rate_bytes`` (single absorb block) and ``msg_bytes``, ``rate_bytes``, ``out_bytes`` are all multiples of 8, so the host packs message and output as ``ulong`` arrays.
+
+State convention: the 1600-bit state is a 5x5 array of 64-bit lanes; lane k (for k in 0..25) corresponds to byte positions 8*k .. 8*k + 7 of the sponge state in little-endian, i.e. lane k holds bytes at the (x, y) cell with x = k % 5 and y = k / 5. The seed shows the standard round constants ``RC[24]`` and rho offsets ``r[x][y]`` from FIPS 202.
+
+Permutation: 24 rounds of theta -> rho -> pi -> chi -> iota as defined in FIPS 202. Concretely, with A the (5,5) state of 64-bit lanes:
+  theta:  C[x]      = A[x,0] ^ A[x,1] ^ A[x,2] ^ A[x,3] ^ A[x,4];
+          D[x]      = C[x-1] ^ rotl(C[x+1], 1);
+          A[x,y]   ^= D[x].
+  rho:    A'[x,y]   = rotl(A[x,y], r[x][y]).
+  pi:     A''[y, (2*x + 3*y) %% 5] = A'[x, y]
+          (equivalently A''[x, y] = A'[(x + 3*y) %% 5, x]).
+  chi:    A'''[x,y] = A''[x,y] ^ ((~A''[(x+1)%%5, y]) & A''[(x+2)%%5, y]).
+  iota:   A''''[0,0] = A'''[0,0] ^ RC[round].
+
+Sponge protocol (msg_bytes < rate_bytes, single absorb block):
+  1. Initialise the state to zero.
+  2. XOR ``msg_bytes / 8`` input lanes into state lanes      0 .. msg_bytes/8 - 1 (little-endian byte stream).
+  3. XOR the domain byte (low 8 bits of ``domain``) into      byte position ``msg_bytes`` (lane ``msg_bytes/8``,      byte 0 of that lane).
+  4. XOR 0x80 into byte position ``rate_bytes - 1``      (lane ``rate_bytes/8 - 1``, byte 7 of that lane).
+  5. Apply Keccak-f[1600].
+  6. Output the first ``rate_bytes / 8`` lanes of state.
+  7. If more output is needed, apply Keccak-f[1600] again      and output the next ``rate_bytes / 8`` lanes; repeat      until ``out_bytes / 8`` lanes have been written. The      final chunk may be shorter than the rate.
+
+The baseline sizes below use the SHA3-256 mode (rate=136, domain=0x06, out=32). The kernel is scored on several (rate_bytes, out_bytes, domain) parameter sets, including configurations not listed among the baseline sizes, and out_bytes may exceed rate_bytes. The kernel must use the runtime values of ``rate_bytes``, ``out_bytes`` and ``domain`` rather than compile-time constants. Correctness is bit-exact against ``hashlib.sha3_256`` / ``hashlib.shake_128``; any mismatched output ulong rejects the candidate.
+
+## Required kernel signature(s)
+
+```
+kernel void keccak_f1600_batch(
+    device const ulong *in_data    [[buffer(0)]],
+    device       ulong *out_data   [[buffer(1)]],
+    constant uint      &batch      [[buffer(2)]],
+    constant uint      &msg_bytes  [[buffer(3)]],
+    constant uint      &rate_bytes [[buffer(4)]],
+    constant uint      &out_bytes  [[buffer(5)]],
+    constant uint      &domain     [[buffer(6)]],
+    uint idx [[thread_position_in_grid]]);
+
+Dispatch (host-fixed):
+  threadsPerGrid        = (batch, 1, 1)
+  threadsPerThreadgroup = (min(batch, 64), 1, 1)
+Each thread processes ONE instance end-to-end; guard against idx >= batch (the grid is rounded up to a multiple of the TG width). All test sizes have msg_bytes = 32. ``in_data`` is laid out as batch consecutive runs of ``msg_bytes / 8`` ulongs; ``out_data`` as batch consecutive runs of ``out_bytes / 8`` ulongs. Threadgroup-cooperative and simdgroup-cooperative implementations are valid so long as the external buffer layout above is preserved.
+```
+
+## Your previous attempt
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint2 KECCAK_RC[24] = {
+    uint2(0x00000001, 0x00000000), uint2(0x00008082, 0x00000000), uint2(0x0000808A, 0x80000000),
+    uint2(0x80008000, 0x80000000), uint2(0x0000808B, 0x00000000), uint2(0x80000001, 0x00000000),
+    uint2(0x80008081, 0x80000000), uint2(0x00008009, 0x80000000), uint2(0x0000008A, 0x00000000),
+    uint2(0x00000088, 0x00000000), uint2(0x80008009, 0x00000000), uint2(0x8000000A, 0x00000000),
+    uint2(0x8000808B, 0x00000000), uint2(0x0000008B, 0x80000000), uint2(0x00008089, 0x80000000),
+    uint2(0x00008003, 0x80000000), uint2(0x00008002, 0x80000000), uint2(0x00000080, 0x80000000),
+    uint2(0x0000800A, 0x00000000), uint2(0x8000000A, 0x80000000), uint2(0x80008081, 0x80000000),
+    uint2(0x00008080, 0x80000000), uint2(0x80000001, 0x00000000), uint2(0x80008008, 0x80000000)
+};
+
+inline __attribute__((always_inline)) uint2 rotl_constant(uint2 v, uint k) {
+    if (k == 0) return v;
+    if (k < 32) return uint2((v.x << k) | (v.y >> (32 - k)), (v.y << k) | (v.x >> (32 - k)));
+    if (k == 32) return uint2(v.y, v.x);
+    uint j = k - 32;
+    return uint2((v.y << j) | (v.x >> (32 - j)), (v.x << j) | (v.y >> (32 - j)));
+}
+
+inline __attribute__((always_inline)) void keccak_f1600(thread uint2 *A) {
+    uint2 E[25];
+
+    #pragma unroll
+    for (uint r = 0; r < 24; r += 2) {
+        // --- Round r: A -> E ---
+        uint2 C0 = A[0] ^ A[5] ^ A[10] ^ A[15] ^ A[20];
+        uint2 C1 = A[1] ^ A[6] ^ A[11] ^ A[16] ^ A[21];
+        uint2 C2 = A[2] ^ A[7] ^ A[12] ^ A[17] ^ A[22];
+        uint2 C3 = A[3] ^ A[8] ^ A[13] ^ A[18] ^ A[23];
+        uint2 C4 = A[4] ^ A[9] ^ A[14] ^ A[19] ^ A[24];
+
+        uint2 D0 = C4 ^ rotl_constant(C1, 1);
+        uint2 D1 = C0 ^ rotl_constant(C2, 1);
+        uint2 D2 = C1 ^ rotl_constant(C3, 1);
+        uint2 D3 = C2 ^ rotl_constant(C4, 1);
+        uint2 D4 = C3 ^ rotl_constant(C0, 1);
+
+        uint2 B0 = A[0] ^ D0;
+        uint2 B1 = rotl_constant(A[6] ^ D1, 44);
+        uint2 B2 = rotl_constant(A[12] ^ D2, 43);
+        uint2 B3 = rotl_constant(A[18] ^ D3, 21);
+        uint2 B4 = rotl_constant(A[24] ^ D4, 14);
+        E[0] = B0 ^ (~B1 & B2) ^ KECCAK_RC[r];
+        E[1] = B1 ^ (~B2 & B3);
+        E[2] = B2 ^ (~B3 & B4);
+        E[3] = B3 ^ (~B4 & B0);
+        E[4] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(A[3] ^ D3, 28);
+        B1 = rotl_constant(A[9] ^ D4, 20);
+        B2 = rotl_constant(A[10] ^ D0, 3);
+        B3 = rotl_constant(A[16] ^ D1, 45);
+        B4 = rotl_constant(A[22] ^ D2, 61);
+        E[5] = B0 ^ (~B1 & B2);
+        E[6] = B1 ^ (~B2 & B3);
+        E[7] = B2 ^ (~B3 & B4);
+        E[8] = B3 ^ (~B4 & B0);
+        E[9] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(A[1] ^ D1, 1);
+        B1 = rotl_constant(A[7] ^ D2, 6);
+        B2 = rotl_constant(A[13] ^ D3, 25);
+        B3 = rotl_constant(A[19] ^ D4, 8);
+        B4 = rotl_constant(A[20] ^ D0, 18);
+        E[10] = B0 ^ (~B1 & B2);
+        E[11] = B1 ^ (~B2 & B3);
+        E[12] = B2 ^ (~B3 & B4);
+        E[13] = B3 ^ (~B4 & B0);
+        E[14] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(A[4] ^ D4, 27);
+        B1 = rotl_constant(A[5] ^ D0, 36);
+        B2 = rotl_constant(A[11] ^ D1, 10);
+        B3 = rotl_constant(A[17] ^ D2, 15);
+        B4 = rotl_constant(A[23] ^ D3, 56);
+        E[15] = B0 ^ (~B1 & B2);
+        E[16] = B1 ^ (~B2 & B3);
+        E[17] = B2 ^ (~B3 & B4);
+        E[18] = B3 ^ (~B4 & B0);
+        E[19] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(A[2] ^ D2, 62);
+        B1 = rotl_constant(A[8] ^ D3, 55);
+        B2 = rotl_constant(A[14] ^ D4, 39);
+        B3 = rotl_constant(A[15] ^ D0, 41);
+        B4 = rotl_constant(A[21] ^ D1, 2);
+        E[20] = B0 ^ (~B1 & B2);
+        E[21] = B1 ^ (~B2 & B3);
+        E[22] = B2 ^ (~B3 & B4);
+        E[23] = B3 ^ (~B4 & B0);
+        E[24] = B4 ^ (~B0 & B1);
+
+        // --- Round r+1: E -> A ---
+        C0 = E[0] ^ E[5] ^ E[10] ^ E[15] ^ E[20];
+        C1 = E[1] ^ E[6] ^ E[11] ^ E[16] ^ E[21];
+        C2 = E[2] ^ E[7] ^ E[12] ^ E[17] ^ E[22];
+        C3 = E[3] ^ E[8] ^ E[13] ^ E[18] ^ E[23];
+        C4 = E[4] ^ E[9] ^ E[14] ^ E[19] ^ E[24];
+
+        D0 = C4 ^ rotl_constant(C1, 1);
+        D1 = C0 ^ rotl_constant(C2, 1);
+        D2 = C1 ^ rotl_constant(C3, 1);
+        D3 = C2 ^ rotl_constant(C4, 1);
+        D4 = C3 ^ rotl_constant(C0, 1);
+
+        B0 = E[0] ^ D0;
+        B1 = rotl_constant(E[6] ^ D1, 44);
+        B2 = rotl_constant(E[12] ^ D2, 43);
+        B3 = rotl_constant(E[18] ^ D3, 21);
+        B4 = rotl_constant(E[24] ^ D4, 14);
+        A[0] = B0 ^ (~B1 & B2) ^ KECCAK_RC[r+1];
+        A[1] = B1 ^ (~B2 & B3);
+        A[2] = B2 ^ (~B3 & B4);
+        A[3] = B3 ^ (~B4 & B0);
+        A[4] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(E[3] ^ D3, 28);
+        B1 = rotl_constant(E[9] ^ D4, 20);
+        B2 = rotl_constant(E[10] ^ D0, 3);
+        B3 = rotl_constant(E[16] ^ D1, 45);
+        B4 = rotl_constant(E[22] ^ D2, 61);
+        A[5] = B0 ^ (~B1 & B2);
+        A[6] = B1 ^ (~B2 & B3);
+        A[7] = B2 ^ (~B3 & B4);
+        A[8] = B3 ^ (~B4 & B0);
+        A[9] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(E[1] ^ D1, 1);
+        B1 = rotl_constant(E[7] ^ D2, 6);
+        B2 = rotl_constant(E[13] ^ D3, 25);
+        B3 = rotl_constant(E[19] ^ D4, 8);
+        B4 = rotl_constant(E[20] ^ D0, 18);
+        A[10] = B0 ^ (~B1 & B2);
+        A[11] = B1 ^ (~B2 & B3);
+        A[12] = B2 ^ (~B3 & B4);
+        A[13] = B3 ^ (~B4 & B0);
+        A[14] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(E[4] ^ D4, 27);
+        B1 = rotl_constant(E[5] ^ D0, 36);
+        B2 = rotl_constant(E[11] ^ D1, 10);
+        B3 = rotl_constant(E[17] ^ D2, 15);
+        B4 = rotl_constant(E[23] ^ D3, 56);
+        A[15] = B0 ^ (~B1 & B2);
+        A[16] = B1 ^ (~B2 & B3);
+        A[17] = B2 ^ (~B3 & B4);
+        A[18] = B3 ^ (~B4 & B0);
+        A[19] = B4 ^ (~B0 & B1);
+
+        B0 = rotl_constant(E[2] ^ D2, 62);
+        B1 = rotl_constant(E[8] ^ D3, 55);
+        B2 = rotl_constant(E[14] ^ D4, 39);
+        B3 = rotl_constant(E[15] ^ D0, 41);
+        B4 = rotl_constant(E[21] ^ D1, 2);
+        A[20] = B0 ^ (~B1 & B2);
+        A[21] = B1 ^ (~B2 & B3);
+        A[22] = B2 ^ (~B3 & B4);
+        A[23] = B3 ^ (~B4 & B0);
+        A[24] = B4 ^ (~B0 & B1);
+    }
+}
+
+kernel void keccak_f1600_batch(
+    device const ulong *in_data    [[buffer(0)]],
+    device       ulong *out_data   [[buffer(1)]],
+    constant uint      &batch      [[buffer(2)]],
+    constant uint      &msg_bytes  [[buffer(3)]],
+    constant uint      &rate_bytes [[buffer(4)]],
+    constant uint      &out_bytes  [[buffer(5)]],
+    constant uint      &domain     [[buffer(6)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= batch) return;
+
+    uint2 A[25];
+    #pragma unroll
+    for (uint i = 0; i < 25; ++i) {
+        A[i] = uint2(0, 0);
+    }
+
+    uint msg_lanes  = msg_bytes  >> 3;
+    uint rate_lanes = rate_bytes >> 3;
+    uint out_lanes  = out_bytes  >> 3;
+
+    uint in_base = idx * msg_lanes;
+
+    // Standard Fast-path bypassing unrolled conditionals
+    if (msg_lanes == 4) {
+        A[0] ^= as_type<uint2>(in_data[in_base + 0]);
+        A[1] ^= as_type<uint2>(in_data[in_base + 1]);
+        A[2] ^= as_type<uint2>(in_data[in_base + 2]);
+        A[3] ^= as_type<uint2>(in_data[in_base + 3]);
+        A[4].x ^= (domain & 0xFFu);
+    } else {
+        #pragma unroll
+        for (uint i = 0; i < 25; ++i) {
+            if (i < msg_lanes) {
+                A[i] ^= as_type<uint2>(in_data[in_base + i]);
+            }
+        }
+        #pragma unroll
+        for (uint i = 0; i < 25; ++i) {
+            if (i == msg_lanes) {
+                A[i].x ^= (domain & 0xFFu);
+            }
+        }
+    }
+
+    if (rate_lanes == 17) {
+        A[16].y ^= 0x80000000u;
+    } else if (rate_lanes == 21) {
+        A[20].y ^= 0x80000000u;
+    } else {
+        #pragma unroll
+        for (uint i = 0; i < 25; ++i) {
+            if (i == rate_lanes - 1) {
+                A[i].y ^= 0x80000000u;
+            }
+        }
+    }
+
+    uint out_base = idx * out_lanes;
+
+    if (out_lanes == 4) {
+        keccak_f1600(A);
+        out_data[out_base + 0] = as_type<ulong>(A[0]);
+        out_data[out_base + 1] = as_type<ulong>(A[1]);
+        out_data[out_base + 2] = as_type<ulong>(A[2]);
+        out_data[out_base + 3] = as_type<ulong>(A[3]);
+    } else {
+        uint written = 0;
+        for (;;) {
+            keccak_f1600(A);
+            uint remaining = out_lanes - written;
+            uint take = remaining < rate_lanes ? remaining : rate_lanes;
+            
+            #pragma unroll
+            for (uint i = 0; i < 25; ++i) {
+                if (i < take) {
+                    out_data[out_base + written + i] = as_type<ulong>(A[i]);
+                }
+            }
+
+            written += take;
+            if (written >= out_lanes) break;
+        }
+    }
+}
+```
+
+Result of previous attempt:
+     sha3_256_B16K: correct, 0.45 ms, 135.8 Gbitops/s (u64) (12.1% of 1125 Gops/s (u64 bitop, est))
+    sha3_256_B256K: correct, 1.87 ms, 522.4 Gbitops/s (u64) (46.4% of 1125 Gops/s (u64 bitop, est))
+      sha3_256_B4M: correct, 29.98 ms, 520.4 Gbitops/s (u64) (46.3% of 1125 Gops/s (u64 bitop, est))
+  score (gmean of fraction): 0.2959
+
+## Current best (incumbent)
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+inline ulong rotl(ulong x, uint k) {
+    return (x << k) | (x >> (64u - k));
+}
+
+inline void keccak_f1600(thread ulong *A) {
+    constexpr ulong RC[24] = {
+        0x0000000000000001ul, 0x0000000000008082ul, 0x800000000000808Aul,
+        0x8000000080008000ul, 0x000000000000808Bul, 0x0000000080000001ul,
+        0x8000000080008081ul, 0x8000000000008009ul, 0x000000000000008Aul,
+        0x0000000000000088ul, 0x0000000080008009ul, 0x000000008000000Aul,
+        0x000000008000808Bul, 0x800000000000008Bul, 0x8000000000008089ul,
+        0x8000000000008003ul, 0x8000000000008002ul, 0x8000000000000080ul,
+        0x000000000000800Aul, 0x800000008000000Aul, 0x8000000080008081ul,
+        0x8000000000008080ul, 0x0000000080000001ul, 0x8000000080008008ul,
+    };
+
+    ulong E[25];
+
+    #pragma unroll 12
+    for (uint r = 0; r < 24; r += 2) {
+        // --- Round r: A -> E ---
+        ulong C0 = A[0] ^ A[5] ^ A[10] ^ A[15] ^ A[20];
+        ulong C1 = A[1] ^ A[6] ^ A[11] ^ A[16] ^ A[21];
+        ulong C2 = A[2] ^ A[7] ^ A[12] ^ A[17] ^ A[22];
+        ulong C3 = A[3] ^ A[8] ^ A[13] ^ A[18] ^ A[23];
+        ulong C4 = A[4] ^ A[9] ^ A[14] ^ A[19] ^ A[24];
+
+        ulong D0 = C4 ^ rotl(C1, 1u);
+        ulong D1 = C0 ^ rotl(C2, 1u);
+        ulong D2 = C1 ^ rotl(C3, 1u);
+        ulong D3 = C2 ^ rotl(C4, 1u);
+        ulong D4 = C3 ^ rotl(C0, 1u);
+
+        ulong B0 = A[0] ^ D0;
+        ulong B1 = rotl(A[6] ^ D1, 44u);
+        ulong B2 = rotl(A[12] ^ D2, 43u);
+        ulong B3 = rotl(A[18] ^ D3, 21u);
+        ulong B4 = rotl(A[24] ^ D4, 14u);
+        E[0] = B0 ^ (~B1 & B2) ^ RC[r];
+        E[1] = B1 ^ (~B2 & B3);
+        E[2] = B2 ^ (~B3 & B4);
+        E[3] = B3 ^ (~B4 & B0);
+        E[4] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(A[3] ^ D3, 28u);
+        B1 = rotl(A[9] ^ D4, 20u);
+        B2 = rotl(A[10] ^ D0, 3u);
+        B3 = rotl(A[16] ^ D1, 45u);
+        B4 = rotl(A[22] ^ D2, 61u);
+        E[5] = B0 ^ (~B1 & B2);
+        E[6] = B1 ^ (~B2 & B3);
+        E[7] = B2 ^ (~B3 & B4);
+        E[8] = B3 ^ (~B4 & B0);
+        E[9] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(A[1] ^ D1, 1u);
+        B1 = rotl(A[7] ^ D2, 6u);
+        B2 = rotl(A[13] ^ D3, 25u);
+        B3 = rotl(A[19] ^ D4, 8u);
+        B4 = rotl(A[20] ^ D0, 18u);
+        E[10] = B0 ^ (~B1 & B2);
+        E[11] = B1 ^ (~B2 & B3);
+        E[12] = B2 ^ (~B3 & B4);
+        E[13] = B3 ^ (~B4 & B0);
+        E[14] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(A[4] ^ D4, 27u);
+        B1 = rotl(A[5] ^ D0, 36u);
+        B2 = rotl(A[11] ^ D1, 10u);
+        B3 = rotl(A[17] ^ D2, 15u);
+        B4 = rotl(A[23] ^ D3, 56u);
+        E[15] = B0 ^ (~B1 & B2);
+        E[16] = B1 ^ (~B2 & B3);
+        E[17] = B2 ^ (~B3 & B4);
+        E[18] = B3 ^ (~B4 & B0);
+        E[19] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(A[2] ^ D2, 62u);
+        B1 = rotl(A[8] ^ D3, 55u);
+        B2 = rotl(A[14] ^ D4, 39u);
+        B3 = rotl(A[15] ^ D0, 41u);
+        B4 = rotl(A[21] ^ D1, 2u);
+        E[20] = B0 ^ (~B1 & B2);
+        E[21] = B1 ^ (~B2 & B3);
+        E[22] = B2 ^ (~B3 & B4);
+        E[23] = B3 ^ (~B4 & B0);
+        E[24] = B4 ^ (~B0 & B1);
+
+        // --- Round r+1: E -> A ---
+        C0 = E[0] ^ E[5] ^ E[10] ^ E[15] ^ E[20];
+        C1 = E[1] ^ E[6] ^ E[11] ^ E[16] ^ E[21];
+        C2 = E[2] ^ E[7] ^ E[12] ^ E[17] ^ E[22];
+        C3 = E[3] ^ E[8] ^ E[13] ^ E[18] ^ E[23];
+        C4 = E[4] ^ E[9] ^ E[14] ^ E[19] ^ E[24];
+
+        D0 = C4 ^ rotl(C1, 1u);
+        D1 = C0 ^ rotl(C2, 1u);
+        D2 = C1 ^ rotl(C3, 1u);
+        D3 = C2 ^ rotl(C4, 1u);
+        D4 = C3 ^ rotl(C0, 1u);
+
+        B0 = E[0] ^ D0;
+        B1 = rotl(E[6] ^ D1, 44u);
+        B2 = rotl(E[12] ^ D2, 43u);
+        B3 = rotl(E[18] ^ D3, 21u);
+        B4 = rotl(E[24] ^ D4, 14u);
+        A[0] = B0 ^ (~B1 & B2) ^ RC[r+1];
+        A[1] = B1 ^ (~B2 & B3);
+        A[2] = B2 ^ (~B3 & B4);
+        A[3] = B3 ^ (~B4 & B0);
+        A[4] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(E[3] ^ D3, 28u);
+        B1 = rotl(E[9] ^ D4, 20u);
+        B2 = rotl(E[10] ^ D0, 3u);
+        B3 = rotl(E[16] ^ D1, 45u);
+        B4 = rotl(E[22] ^ D2, 61u);
+        A[5] = B0 ^ (~B1 & B2);
+        A[6] = B1 ^ (~B2 & B3);
+        A[7] = B2 ^ (~B3 & B4);
+        A[8] = B3 ^ (~B4 & B0);
+        A[9] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(E[1] ^ D1, 1u);
+        B1 = rotl(E[7] ^ D2, 6u);
+        B2 = rotl(E[13] ^ D3, 25u);
+        B3 = rotl(E[19] ^ D4, 8u);
+        B4 = rotl(E[20] ^ D0, 18u);
+        A[10] = B0 ^ (~B1 & B2);
+        A[11] = B1 ^ (~B2 & B3);
+        A[12] = B2 ^ (~B3 & B4);
+        A[13] = B3 ^ (~B4 & B0);
+        A[14] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(E[4] ^ D4, 27u);
+        B1 = rotl(E[5] ^ D0, 36u);
+        B2 = rotl(E[11] ^ D1, 10u);
+        B3 = rotl(E[17] ^ D2, 15u);
+        B4 = rotl(E[23] ^ D3, 56u);
+        A[15] = B0 ^ (~B1 & B2);
+        A[16] = B1 ^ (~B2 & B3);
+        A[17] = B2 ^ (~B3 & B4);
+        A[18] = B3 ^ (~B4 & B0);
+        A[19] = B4 ^ (~B0 & B1);
+
+        B0 = rotl(E[2] ^ D2, 62u);
+        B1 = rotl(E[8] ^ D3, 55u);
+        B2 = rotl(E[14] ^ D4, 39u);
+        B3 = rotl(E[15] ^ D0, 41u);
+        B4 = rotl(E[21] ^ D1, 2u);
+        A[20] = B0 ^ (~B1 & B2);
+        A[21] = B1 ^ (~B2 & B3);
+        A[22] = B2 ^ (~B3 & B4);
+        A[23] = B3 ^ (~B4 & B0);
+        A[24] = B4 ^ (~B0 & B1);
+    }
+}
+
+kernel void keccak_f1600_batch(
+    device const ulong *in_data    [[buffer(0)]],
+    device       ulong *out_data   [[buffer(1)]],
+    constant uint      &batch      [[buffer(2)]],
+    constant uint      &msg_bytes  [[buffer(3)]],
+    constant uint      &rate_bytes [[buffer(4)]],
+    constant uint      &out_bytes  [[buffer(5)]],
+    constant uint      &domain     [[buffer(6)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= batch) return;
+
+    ulong A[25];
+    #pragma unroll
+    for (uint i = 0; i < 25; ++i) {
+        A[i] = 0;
+    }
+
+    uint msg_lanes  = msg_bytes  >> 3;
+    uint rate_lanes = rate_bytes >> 3;
+    uint out_lanes  = out_bytes  >> 3;
+
+    uint in_base = idx * msg_lanes;
+    ulong domain_val = (ulong)(domain & 0xFFu);
+
+    // Fast-path for common input length
+    if (msg_lanes == 4) {
+        A[0] ^= in_data[in_base + 0];
+        A[1] ^= in_data[in_base + 1];
+        A[2] ^= in_data[in_base + 2];
+        A[3] ^= in_data[in_base + 3];
+        A[4] ^= domain_val;
+    } else {
+        switch (msg_lanes) {
+            case 24: A[23] ^= in_data[in_base + 23];
+            case 23: A[22] ^= in_data[in_base + 22];
+            case 22: A[21] ^= in_data[in_base + 21];
+            case 21: A[20] ^= in_data[in_base + 20];
+            case 20: A[19] ^= in_data[in_base + 19];
+            case 19: A[18] ^= in_data[in_base + 18];
+            case 18: A[17] ^= in_data[in_base + 17];
+            case 17: A[16] ^= in_data[in_base + 16];
+            case 16: A[15] ^= in_data[in_base + 15];
+            case 15: A[14] ^= in_data[in_base + 14];
+            case 14: A[13] ^= in_data[in_base + 13];
+            case 13: A[12] ^= in_data[in_base + 12];
+            case 12: A[11] ^= in_data[in_base + 11];
+            case 11: A[10] ^= in_data[in_base + 10];
+            case 10: A[ 9] ^= in_data[in_base +  9];
+            case  9: A[ 8] ^= in_data[in_base +  8];
+            case  8: A[ 7] ^= in_data[in_base +  7];
+            case  7: A[ 6] ^= in_data[in_base +  6];
+            case  6: A[ 5] ^= in_data[in_base +  5];
+            case  5: A[ 4] ^= in_data[in_base +  4];
+            case  4: A[ 3] ^= in_data[in_base +  3];
+            case  3: A[ 2] ^= in_data[in_base +  2];
+            case  2: A[ 1] ^= in_data[in_base +  1];
+            case  1: A[ 0] ^= in_data[in_base +  0]; break;
+            default: break;
+        }
+        switch (msg_lanes) {
+            case 24: A[24] ^= domain_val; break;
+            case 23: A[23] ^= domain_val; break;
+            case 22: A[22] ^= domain_val; break;
+            case 21: A[21] ^= domain_val; break;
+            case 20: A[20] ^= domain_val; break;
+            case 19: A[19] ^= domain_val; break;
+            case 18: A[18] ^= domain_val; break;
+            case 17: A[17] ^= domain_val; break;
+            case 16: A[16] ^= domain_val; break;
+            case 15: A[15] ^= domain_val; break;
+            case 14: A[14] ^= domain_val; break;
+            case 13: A[13] ^= domain_val; break;
+            case 12: A[12] ^= domain_val; break;
+            case 11: A[11] ^= domain_val; break;
+            case 10: A[10] ^= domain_val; break;
+            case  9: A[ 9] ^= domain_val; break;
+            case  8: A[ 8] ^= domain_val; break;
+            case  7: A[ 7] ^= domain_val; break;
+            case  6: A[ 6] ^= domain_val; break;
+            case  5: A[ 5] ^= domain_val; break;
+            case  4: A[ 4] ^= domain_val; break;
+            case  3: A[ 3] ^= domain_val; break;
+            case  2: A[ 2] ^= domain_val; break;
+            case  1: A[ 1] ^= domain_val; break;
+            case  0: A[ 0] ^= domain_val; break;
+            default: break;
+        }
+    }
+
+    // Fast-paths for common SHA3-256 (rate_lanes=17) and SHAKE-128 (rate_lanes=21) paddings
+    if (rate_lanes == 17) {
+        A[16] ^= 0x8000000000000000ul;
+    } else if (rate_lanes == 21) {
+        A[20] ^= 0x8000000000000000ul;
+    } else {
+        switch (rate_lanes - 1) {
+            case 24: A[24] ^= 0x8000000000000000ul; break;
+            case 23: A[23] ^= 0x8000000000000000ul; break;
+            case 22: A[22] ^= 0x8000000000000000ul; break;
+            case 21: A[21] ^= 0x8000000000000000ul; break;
+            case 20: A[20] ^= 0x8000000000000000ul; break;
+            case 19: A[19] ^= 0x8000000000000000ul; break;
+            case 18: A[18] ^= 0x8000000000000000ul; break;
+            case 17: A[17] ^= 0x8000000000000000ul; break;
+            case 16: A[16] ^= 0x8000000000000000ul; break;
+            case 15: A[15] ^= 0x8000000000000000ul; break;
+            case 14: A[14] ^= 0x8000000000000000ul; break;
+            case 13: A[13] ^= 0x8000000000000000ul; break;
+            case 12: A[12] ^= 0x8000000000000000ul; break;
+            case 11: A[11] ^= 0x8000000000000000ul; break;
+            case 10: A[10] ^= 0x8000000000000000ul; break;
+            case  9: A[ 9] ^= 0x8000000000000000ul; break;
+            case  8: A[ 8] ^= 0x8000000000000000ul; break;
+            case  7: A[ 7] ^= 0x8000000000000000ul; break;
+            case  6: A[ 6] ^= 0x8000000000000000ul; break;
+            case  5: A[ 5] ^= 0x8000000000000000ul; break;
+            case  4: A[ 4] ^= 0x8000000000000000ul; break;
+            case  3: A[ 3] ^= 0x8000000000000000ul; break;
+            case  2: A[ 2] ^= 0x8000000000000000ul; break;
+            case  1: A[ 1] ^= 0x8000000000000000ul; break;
+            case  0: A[ 0] ^= 0x8000000000000000ul; break;
+            default: break;
+        }
+    }
+
+    uint out_base = idx * out_lanes;
+
+    // Fast-path for standard 32-byte outputs
+    if (out_lanes == 4) {
+        keccak_f1600(A);
+        out_data[out_base + 0] = A[0];
+        out_data[out_base + 1] = A[1];
+        out_data[out_base + 2] = A[2];
+        out_data[out_base + 3] = A[3];
+    } else {
+        uint written = 0;
+        for (;;) {
+            keccak_f1600(A);
+            uint remaining = out_lanes - written;
+            uint take = remaining < rate_lanes ? remaining : rate_lanes;
+            
+            switch (take) {
+                case 25: out_data[out_base + written + 24] = A[24];
+                case 24: out_data[out_base + written + 23] = A[23];
+                case 23: out_data[out_base + written + 22] = A[22];
+                case 22: out_data[out_base + written + 21] = A[21];
+                case 21: out_data[out_base + written + 20] = A[20];
+                case 20: out_data[out_base + written + 19] = A[19];
+                case 19: out_data[out_base + written + 18] = A[18];
+                case 18: out_data[out_base + written + 17] = A[17];
+                case 17: out_data[out_base + written + 16] = A[16];
+                case 16: out_data[out_base + written + 15] = A[15];
+                case 15: out_data[out_base + written + 14] = A[14];
+                case 14: out_data[out_base + written + 13] = A[13];
+                case 13: out_data[out_base + written + 12] = A[12];
+                case 12: out_data[out_base + written + 11] = A[11];
+                case 11: out_data[out_base + written + 10] = A[10];
+                case 10: out_data[out_base + written +  9] = A[ 9];
+                case  9: out_data[out_base + written +  8] = A[ 8];
+                case  8: out_data[out_base + written +  7] = A[ 7];
+                case  7: out_data[out_base + written +  6] = A[ 6];
+                case  6: out_data[out_base + written +  5] = A[ 5];
+                case  5: out_data[out_base + written +  4] = A[ 4];
+                case  4: out_data[out_base + written +  3] = A[ 3];
+                case  3: out_data[out_base + written +  2] = A[ 2];
+                case  2: out_data[out_base + written +  1] = A[ 1];
+                case  1: out_data[out_base + written +  0] = A[ 0]; break;
+                default: break;
+            }
+
+            written += take;
+            if (written >= out_lanes) break;
+        }
+    }
+}
+```
+
+Incumbent result:
+     sha3_256_B16K: correct, 0.31 ms, 199.7 Gbitops/s (u64) (17.8% of 1125 Gops/s (u64 bitop, est))
+    sha3_256_B256K: correct, 1.86 ms, 525.1 Gbitops/s (u64) (46.7% of 1125 Gops/s (u64 bitop, est))
+      sha3_256_B4M: correct, 22.02 ms, 708.5 Gbitops/s (u64) (63.0% of 1125 Gops/s (u64 bitop, est))
+  score (gmean of fraction): 0.3737
+
+## History
+
+- iter  0: compile=OK | correct=True | score=0.03916592497170866
+- iter  1: compile=OK | correct=True | score=0.3300328432407895
+- iter  2: compile=OK | correct=True | score=0.37367744092898847
+- iter  3: compile=OK | correct=True | score=0.34766545781404606
+- iter  4: compile=OK | correct=True | score=0.3517096437888823
+- iter  5: compile=OK | correct=True | score=0.3734132102472631
+- iter  6: compile=OK | correct=True | score=0.29594792770962075
+
+## Instructions
+
+Write an improved Metal kernel. Address the failure mode in the
+previous attempt (if any), then push beyond the incumbent. Output ONE
+fenced ```metal``` code block. Preserve kernel name(s) and buffer
+indices.

@@ -1,0 +1,48 @@
+{
+  "task": "wots_chain",
+  "redactions": [
+    {
+      "find": "(in-distribution n_bytes=16, held-out n_bytes=32; rate_bytes=136)",
+      "replace": "(``n_bytes`` is bound at runtime and varies across the configurations the kernel is scored on; rate_bytes=136)",
+      "note": "description: removes held-out n_bytes=32",
+      "n_matches": 1,
+      "where": [
+        "description"
+      ]
+    },
+    {
+      "find": "(``w`` in {16, 64, 256} in the in-distribution sweep, ``n_bytes`` 16 -> 32 between in-distribution and held-out)",
+      "replace": "(``w`` in {16, 64, 256} among the baseline sizes shown; both ``w`` and ``n_bytes`` are bound at runtime and vary across the configurations the kernel is scored on)",
+      "note": "description: removes the n_bytes 16->32 held-out hint",
+      "n_matches": 1,
+      "where": [
+        "description"
+      ]
+    },
+    {
+      "find": "held-out n_bytes=32; rate_bytes=136), so every chain step is a",
+      "replace": "rate_bytes=136), so every chain step is a",
+      "note": "seed comment: removes held-out n_bytes=32",
+      "n_matches": 1,
+      "where": [
+        "seed"
+      ]
+    },
+    {
+      "find": "(chunk size; 16 in-dist, 32 held-out)",
+      "replace": "(chunk size; bound at runtime)",
+      "note": "seed comment: removes held-out n_bytes=32",
+      "n_matches": 1,
+      "where": [
+        "seed"
+      ]
+    }
+  ],
+  "denylist": [
+    "held-out",
+    "n_bytes=32",
+    "16 -> 32",
+    "32 held-out",
+    "16 in-dist"
+  ]
+}

@@ -1,0 +1,132 @@
+{
+  "task": "merkle_build",
+  "model": "gemini-3.1-pro-preview",
+  "chip": "Apple M1 Pro",
+  "n_iterations": 10,
+  "seed_score": 0.30415083000511656,
+  "best_score": 0.4096531843567248,
+  "improvement": 1.3468751157109564,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.30415083000511656,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/00_seed.metal",
+      "elapsed_s": 1.212658166885376,
+      "is_new_best": true
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.3270893139365812,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/01_candidate.metal",
+      "elapsed_s": 284.03545212745667,
+      "is_new_best": true
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.4096531843567248,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/02_candidate.metal",
+      "elapsed_s": 259.37587094306946,
+      "is_new_best": true
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.3999231153310467,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/03_candidate.metal",
+      "elapsed_s": 290.6559376716614,
+      "is_new_best": false
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.3644231868998721,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/04_candidate.metal",
+      "elapsed_s": 269.5369791984558,
+      "is_new_best": false
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.3082305210129887,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/05_candidate.metal",
+      "elapsed_s": 269.4183428287506,
+      "is_new_best": false
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.3908999114223037,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/06_candidate.metal",
+      "elapsed_s": 237.33208084106445,
+      "is_new_best": false
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.38105819215659803,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/07_candidate.metal",
+      "elapsed_s": 288.32270216941833,
+      "is_new_best": false
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.394703718703674,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/08_candidate.metal",
+      "elapsed_s": 225.7997260093689,
+      "is_new_best": false
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.37904853691690965,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/09_candidate.metal",
+      "elapsed_s": 240.70117330551147,
+      "is_new_best": false
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.3870575527970665,
+      "fail_reason": null,
+      "source_path": "results/merkle_build_gemini-3.1-pro-preview_20260516_150439/10_candidate.metal",
+      "elapsed_s": 266.20397996902466,
+      "is_new_best": false
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2530444956927559,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/00_seed.metal",
+    "elapsed_s": 1.3355729579925537,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2014186337120031,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/01_candidate.metal",
+    "elapsed_s": 219.8866159915924,
+    "is_new_best": false
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.20126028888524133,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/02_candidate.metal",
+    "elapsed_s": 192.76773881912231,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2598657192160378,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/03_candidate.metal",
+    "elapsed_s": 222.40388894081116,
+    "is_new_best": true
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": false,
+    "score": null,
+    "fail_reason": "correctness failed at size f2_N64K: bit_exact=64069",
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/04_candidate.metal",
+    "elapsed_s": 225.55763626098633,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.20285617538622955,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/05_candidate.metal",
+    "elapsed_s": 284.54209089279175,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.20350859132709612,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/06_candidate.metal",
+    "elapsed_s": 229.84060525894165,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.23256307188333786,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/07_candidate.metal",
+    "elapsed_s": 235.81077909469604,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.23958786999981077,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/08_candidate.metal",
+    "elapsed_s": 242.24805808067322,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": false,
+    "score": null,
+    "fail_reason": "correctness failed at size f2_N64K: bit_exact=65535",
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/09_candidate.metal",
+    "elapsed_s": 240.3321352005005,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.17675697023278825,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.1-pro-preview_20260518_130712/10_candidate.metal",
+    "elapsed_s": 233.85292673110962,
+    "is_new_best": false
+  }
+]

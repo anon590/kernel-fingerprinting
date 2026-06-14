@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": true,
+  "score": 0.004649638837112243,
+  "fail_reason": null,
+  "sizes": [
+    {
+      "label": "kyb_B1",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 3.412500063859625e-05,
+      "achieved": 0.026256409765062425,
+      "achieved_unit": "Gmodmul/s (u32)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.0004921928592937488
+    },
+    {
+      "label": "kyb_B16",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 3.3854166758828796e-05,
+      "achieved": 0.4234633834625786,
+      "achieved_unit": "Gmodmul/s (u32)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.007938086561628439
+    },
+    {
+      "label": "kyb_B256",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0001671250001891167,
+      "achieved": 1.372481673839586,
+      "achieved_unit": "Gmodmul/s (u32)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.025728029285795623
+    }
+  ]
+}

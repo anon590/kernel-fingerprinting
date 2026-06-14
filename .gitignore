@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Testing / type checkers
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Lean build artifacts / mathlib cache
+.lake/
+
+# Local caches
+.cache/
+
+# macOS
+.DS_Store
+._*

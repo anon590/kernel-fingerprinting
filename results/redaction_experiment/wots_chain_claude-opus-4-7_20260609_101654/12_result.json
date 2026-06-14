@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": true,
+  "score": 0.6378792002326247,
+  "fail_reason": null,
+  "sizes": [
+    {
+      "label": "w16_C64K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0055155208392534405,
+      "achieved": 707.2229139701672,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 1125.0,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.6286425901957041
+    },
+    {
+      "label": "w64_C64K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.021407000000181142,
+      "achieved": 728.8648983915529,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 1125.0,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.6478799096813803
+    },
+    {
+      "label": "w256_C64K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.08705491666478338,
+      "achieved": 716.9180778188882,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 1125.0,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.6372605136167895
+    }
+  ]
+}

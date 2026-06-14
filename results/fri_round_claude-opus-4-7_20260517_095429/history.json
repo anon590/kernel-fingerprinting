@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2736020925683619,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/00_seed.metal",
+    "elapsed_s": 1.3137140274047852,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2547840149418794,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/01_candidate.metal",
+    "elapsed_s": 46.60026431083679,
+    "is_new_best": false
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.26091115284017186,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/02_candidate.metal",
+    "elapsed_s": 46.047253131866455,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.26021751240299773,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/03_candidate.metal",
+    "elapsed_s": 44.88994121551514,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2612601633088594,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/04_candidate.metal",
+    "elapsed_s": 53.4103889465332,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.25377464507822434,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/05_candidate.metal",
+    "elapsed_s": 51.58358860015869,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.24329202285533494,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/06_candidate.metal",
+    "elapsed_s": 53.75358772277832,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3442978844039952,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/07_candidate.metal",
+    "elapsed_s": 56.75135660171509,
+    "is_new_best": true
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.23564698205018722,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/08_candidate.metal",
+    "elapsed_s": 49.986335039138794,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3403158596895179,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/09_candidate.metal",
+    "elapsed_s": 54.12662887573242,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.35267448947851815,
+    "fail_reason": null,
+    "source_path": "results/fri_round_claude-opus-4-7_20260517_095429/10_candidate.metal",
+    "elapsed_s": 49.87266993522644,
+    "is_new_best": true
+  }
+]

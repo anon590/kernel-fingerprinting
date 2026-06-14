@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": true,
+  "score": 0.2640174014489192,
+  "fail_reason": null,
+  "sizes": [
+    {
+      "label": "N2_14",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00015529166557826102,
+      "achieved": 29.541314937394798,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.14770657468697398
+    },
+    {
+      "label": "N2_16",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00037670833626179956,
+      "achieved": 55.67044310223467,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.27835221551117334
+    },
+    {
+      "label": "N2_18",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0010541666670178529,
+      "achieved": 89.52269404132255,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.44761347020661274
+    }
+  ]
+}

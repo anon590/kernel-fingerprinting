@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size kyb_B256: bit_exact=2863",
+  "sizes": [
+    {
+      "label": "kyb_B1",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 2.262499992866651e-05,
+      "achieved": 0.03960221006961166,
+      "achieved_unit": "Gmodmul/s (u32)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.0007423682515212115
+    },
+    {
+      "label": "kyb_B16",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 2.6749999960884452e-05,
+      "achieved": 0.5359252344285237,
+      "achieved_unit": "Gmodmul/s (u32)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.010046254452200068
+    },
+    {
+      "label": "kyb_B256",
+      "correct": false,
+      "error_value": 2863,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00010120833348992164,
+      "achieved": 2.2663746362629453,
+      "achieved_unit": "Gmodmul/s (u32)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.04248461318338345
+    }
+  ]
+}

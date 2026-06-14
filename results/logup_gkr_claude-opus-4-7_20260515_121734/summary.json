@@ -1,0 +1,132 @@
+{
+  "task": "logup_gkr",
+  "model": "claude-opus-4-7",
+  "chip": "Apple M1 Pro",
+  "n_iterations": 10,
+  "seed_score": 0.001014074531666877,
+  "best_score": 0.04459558550252404,
+  "improvement": 43.9766349611605,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.001014074531666877,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/00_seed.metal",
+      "elapsed_s": 12.60389494895935,
+      "is_new_best": true
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.004901798097017582,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/01_candidate.metal",
+      "elapsed_s": 33.597821950912476,
+      "is_new_best": true
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.004431301440059308,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/02_candidate.metal",
+      "elapsed_s": 46.05924391746521,
+      "is_new_best": false
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.003648669361099135,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/03_candidate.metal",
+      "elapsed_s": 38.84612011909485,
+      "is_new_best": false
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.004972451308839243,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/04_candidate.metal",
+      "elapsed_s": 39.1142213344574,
+      "is_new_best": true
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.004494865361908353,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/05_candidate.metal",
+      "elapsed_s": 45.9499146938324,
+      "is_new_best": false
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.04459558550252404,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/06_candidate.metal",
+      "elapsed_s": 45.67014503479004,
+      "is_new_best": true
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.040811012892945184,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/07_candidate.metal",
+      "elapsed_s": 49.01362442970276,
+      "is_new_best": false
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.039401419013110686,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/08_candidate.metal",
+      "elapsed_s": 46.67051315307617,
+      "is_new_best": false
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.035914970801963916,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/09_candidate.metal",
+      "elapsed_s": 46.3079137802124,
+      "is_new_best": false
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.035958365538522136,
+      "fail_reason": null,
+      "source_path": "results/logup_gkr_claude-opus-4-7_20260515_121734/10_candidate.metal",
+      "elapsed_s": 47.05915451049805,
+      "is_new_best": false
+    }
+  ]
+}

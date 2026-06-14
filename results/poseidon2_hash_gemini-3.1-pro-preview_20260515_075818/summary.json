@@ -1,0 +1,132 @@
+{
+  "task": "poseidon2_hash",
+  "model": "gemini-3.1-pro-preview",
+  "chip": "Apple M1 Pro",
+  "n_iterations": 10,
+  "seed_score": 0.028874123021347668,
+  "best_score": 0.03139211244518381,
+  "improvement": 1.0872057455034914,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.028874123021347668,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/00_seed.metal",
+      "elapsed_s": 86.42794871330261,
+      "is_new_best": true
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.023034023271217643,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/01_candidate.metal",
+      "elapsed_s": 338.8486580848694,
+      "is_new_best": false
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.025127508237680556,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/02_candidate.metal",
+      "elapsed_s": 319.9153859615326,
+      "is_new_best": false
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.024308146166597093,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/03_candidate.metal",
+      "elapsed_s": 333.34700298309326,
+      "is_new_best": false
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.025078272171242803,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/04_candidate.metal",
+      "elapsed_s": 280.6452257633209,
+      "is_new_best": false
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.024563899554657292,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/05_candidate.metal",
+      "elapsed_s": 307.48561811447144,
+      "is_new_best": false
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.028415924429327454,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/06_candidate.metal",
+      "elapsed_s": 254.39473605155945,
+      "is_new_best": false
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.03139211244518381,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/07_candidate.metal",
+      "elapsed_s": 367.89408016204834,
+      "is_new_best": true
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": false,
+      "score": null,
+      "fail_reason": "correctness failed at size t3_B4K: bit_exact=12288",
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/08_candidate.metal",
+      "elapsed_s": 291.02309226989746,
+      "is_new_best": false
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.02329137946717296,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/09_candidate.metal",
+      "elapsed_s": 325.588121175766,
+      "is_new_best": false
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.025613278727652955,
+      "fail_reason": null,
+      "source_path": "results/poseidon2_hash_gemini-3.1-pro-preview_20260515_075818/10_candidate.metal",
+      "elapsed_s": 264.2729842662811,
+      "is_new_best": false
+    }
+  ]
+}

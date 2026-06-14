@@ -1,0 +1,6 @@
+**Evaluating thread assignment**
+
+I'm looking at how the host launched 32 threads for 32 parents. If threads 0-2 work together for parent 0, then parents 1 and 2's threads aren't computing their outputs, which doesn't match the requirement that each thread must own one parent. Each thread is supposed to compute exactly one output at its specific position in the grid, making it tricky to assign multiple lanes to the same output. Perhaps a rotation system among groups of threads could work, but that adds complexity and redundancy.
+**Considering optimization for addition**
+
+I’m exploring a way to create a faster method for adding three numbers with one reduction. It seems the previous add3 function is correct for canonical inputs, and I think using `gold_add3` can be beneficial for sums of three since it canonizes after each addition. I’m curious about the efficiency of it by comparing how it counts carries and calculating the overflow. Although this could improve performance, I wonder if the previous implementation has too many extra operations.

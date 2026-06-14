@@ -1,0 +1,165 @@
+To push the performance beyond the already highly-optimized previous attempt, we apply four key micro-optimizations targeting the Apple Silicon (ARM64) LLVM backend and memory controller:
+
+1. **Instruction Selection for ARM64 Crypto Extensions:** Rewrote the Chi step to exactly match the pattern `X ^ (Y & ~Z)`. LLVM aggressively maps this to the ARMv8 `BCAX` instruction, saving ALU cycles.
+2. **Immediate Embedding:** Changed the `KECCAK_RC` array to `constexpr constant`. This forces the compiler to embed the 64-bit round constants as inline immediates (via `MOVZ/MOVK`) rather than loading them from the device constant memory pool on every round.
+3. **Vectorized Memory Accesses:** Replaced scalar memory operations with `ulong2` and `ulong4` pointer casts. This guarantees 100% coalesced 16-byte and 32-byte transactions per thread, eliminating redundant memory instructions during the initial absorb and final squeeze.
+4. **Branch Elimination:** Removed the dead branch inside `rotl64_opt` since all our rotate constants are non-zero literals.
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+constexpr constant ulong SHA3_DOMAIN_WORD = 0x06ul;
+constexpr constant ulong SHA3_FINAL_PAD   = 0x8000000000000000ul;
+
+constexpr constant ulong KECCAK_RC[24] = {
+    0x0000000000000001ul, 0x0000000000008082ul, 0x800000000000808Aul,
+    0x8000000080008000ul, 0x000000000000808Bul, 0x0000000080000001ul,
+    0x8000000080008081ul, 0x8000000000008009ul, 0x000000000000008Aul,
+    0x0000000000000088ul, 0x0000000080008009ul, 0x000000008000000Aul,
+    0x000000008000808Bul, 0x800000000000008Bul, 0x8000000000008089ul,
+    0x8000000000008003ul, 0x8000000000008002ul, 0x8000000000000080ul,
+    0x000000000000800Aul, 0x800000008000000Aul, 0x8000000080008081ul,
+    0x8000000000008080ul, 0x0000000080000001ul, 0x8000000080008008ul
+};
+
+inline ulong rotl64_opt(ulong x, uint k) {
+    return (x << k) | (x >> (64u - k));
+}
+
+inline __attribute__((always_inline))
+void keccak_f1600(thread ulong (&A)[25]) {
+    #pragma unroll
+    for (uint r = 0; r < 24; ++r) {
+        ulong C[5];
+        C[0] = A[0] ^ A[5] ^ A[10] ^ A[15] ^ A[20];
+        C[1] = A[1] ^ A[6] ^ A[11] ^ A[16] ^ A[21];
+        C[2] = A[2] ^ A[7] ^ A[12] ^ A[17] ^ A[22];
+        C[3] = A[3] ^ A[8] ^ A[13] ^ A[18] ^ A[23];
+        C[4] = A[4] ^ A[9] ^ A[14] ^ A[19] ^ A[24];
+
+        ulong D[5];
+        D[0] = C[4] ^ rotl64_opt(C[1], 1u);
+        D[1] = C[0] ^ rotl64_opt(C[2], 1u);
+        D[2] = C[1] ^ rotl64_opt(C[3], 1u);
+        D[3] = C[2] ^ rotl64_opt(C[4], 1u);
+        D[4] = C[3] ^ rotl64_opt(C[0], 1u);
+
+        ulong B[25];
+        B[ 0] = A[ 0] ^ D[0];
+        B[10] = rotl64_opt(A[ 1] ^ D[1],  1u);
+        B[20] = rotl64_opt(A[ 2] ^ D[2], 62u);
+        B[ 5] = rotl64_opt(A[ 3] ^ D[3], 28u);
+        B[15] = rotl64_opt(A[ 4] ^ D[4], 27u);
+
+        B[16] = rotl64_opt(A[ 5] ^ D[0], 36u);
+        B[ 1] = rotl64_opt(A[ 6] ^ D[1], 44u);
+        B[11] = rotl64_opt(A[ 7] ^ D[2],  6u);
+        B[21] = rotl64_opt(A[ 8] ^ D[3], 55u);
+        B[ 6] = rotl64_opt(A[ 9] ^ D[4], 20u);
+
+        B[ 7] = rotl64_opt(A[10] ^ D[0],  3u);
+        B[17] = rotl64_opt(A[11] ^ D[1], 10u);
+        B[ 2] = rotl64_opt(A[12] ^ D[2], 43u);
+        B[12] = rotl64_opt(A[13] ^ D[3], 25u);
+        B[22] = rotl64_opt(A[14] ^ D[4], 39u);
+
+        B[23] = rotl64_opt(A[15] ^ D[0], 41u);
+        B[ 8] = rotl64_opt(A[16] ^ D[1], 45u);
+        B[18] = rotl64_opt(A[17] ^ D[2], 15u);
+        B[ 3] = rotl64_opt(A[18] ^ D[3], 21u);
+        B[13] = rotl64_opt(A[19] ^ D[4],  8u);
+
+        B[14] = rotl64_opt(A[20] ^ D[0], 18u);
+        B[24] = rotl64_opt(A[21] ^ D[1],  2u);
+        B[ 9] = rotl64_opt(A[22] ^ D[2], 61u);
+        B[19] = rotl64_opt(A[23] ^ D[3], 56u);
+        B[ 4] = rotl64_opt(A[24] ^ D[4], 14u);
+
+        // Chi logic rearranged strictly to B[y+0] ^ (B[y+2] & ~B[y+1]) 
+        // to forcefully trigger the ARMv8 'BCAX' (Bit Clear and Exclusive OR) instructions
+        #pragma unroll
+        for (uint y = 0; y < 25; y += 5) {
+            A[y + 0] = B[y + 0] ^ (B[y + 2] & ~B[y + 1]);
+            A[y + 1] = B[y + 1] ^ (B[y + 3] & ~B[y + 2]);
+            A[y + 2] = B[y + 2] ^ (B[y + 4] & ~B[y + 3]);
+            A[y + 3] = B[y + 3] ^ (B[y + 0] & ~B[y + 4]);
+            A[y + 4] = B[y + 4] ^ (B[y + 1] & ~B[y + 0]);
+        }
+
+        A[0] ^= KECCAK_RC[r];
+    }
+}
+
+kernel void wots_chain(
+    device const ulong *seeds    [[buffer(0)]],
+    device       ulong *tips     [[buffer(1)]],
+    constant uint      &n_chains [[buffer(2)]],
+    constant uint      &n_bytes  [[buffer(3)]],
+    constant uint      &w        [[buffer(4)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= n_chains) return;
+    
+    uint chain_len = w;
+
+    if (n_bytes == 16) {
+        ulong A[25];
+        
+        // Fully vectorized load ensuring single coalesced transaction
+        ulong2 s = ((device const ulong2*)seeds)[idx];
+        A[0] = s.x;
+        A[1] = s.y;
+        
+        for (uint step = 0; step < chain_len; ++step) {
+            #pragma unroll
+            for (uint i = 2; i < 25; ++i) A[i] = 0ul;
+            A[2] = SHA3_DOMAIN_WORD;
+            A[16] = SHA3_FINAL_PAD;
+            keccak_f1600(A);
+        }
+        
+        // Fully vectorized coalesced store
+        ((device ulong2*)tips)[idx] = ulong2(A[0], A[1]);
+        
+    } else if (n_bytes == 32) {
+        ulong A[25];
+        
+        ulong4 s = ((device const ulong4*)seeds)[idx];
+        A[0] = s.x;
+        A[1] = s.y;
+        A[2] = s.z;
+        A[3] = s.w;
+        
+        for (uint step = 0; step < chain_len; ++step) {
+            #pragma unroll
+            for (uint i = 4; i < 25; ++i) A[i] = 0ul;
+            A[4] = SHA3_DOMAIN_WORD;
+            A[16] = SHA3_FINAL_PAD;
+            keccak_f1600(A);
+        }
+        
+        ((device ulong4*)tips)[idx] = ulong4(A[0], A[1], A[2], A[3]);
+        
+    } else {
+        uint n_lanes = n_bytes >> 3;
+        ulong A[25];
+        uint base = idx * n_lanes;
+        
+        for (uint k = 0; k < n_lanes; ++k) {
+            A[k] = seeds[base + k];
+        }
+        
+        for (uint step = 0; step < chain_len; ++step) {
+            for (uint i = n_lanes; i < 25; ++i) A[i] = 0ul;
+            A[n_lanes] ^= SHA3_DOMAIN_WORD;
+            A[16] ^= SHA3_FINAL_PAD;
+            keccak_f1600(A);
+        }
+        
+        for (uint k = 0; k < n_lanes; ++k) {
+            tips[base + k] = A[k];
+        }
+    }
+}
+```

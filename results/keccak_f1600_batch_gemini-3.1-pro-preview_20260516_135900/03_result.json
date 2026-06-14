@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size sha3_256_B16K: bit_exact=65536",
+  "sizes": [
+    {
+      "label": "sha3_256_B16K",
+      "correct": false,
+      "error_value": 65536,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0005762083328590961,
+      "achieved": 105.77507565289604,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 577.4018126603683,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.18319145062177639
+    }
+  ]
+}

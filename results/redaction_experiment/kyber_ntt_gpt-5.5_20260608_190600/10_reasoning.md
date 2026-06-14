@@ -1,0 +1,6 @@
+**Considering MSL compile issues**
+
+I’m looking at potential compile issues with MSL. The `constexpr constant uint N_MAX = 256u` compiled previously, so that’s fine. I'm considering using `uint` offsets but maybe `size_t` is better since the batch size could get large. The function macro with `simd_shuffle(_zv, (ushort)_src)` uses C-style casting, which MSL supports. Inlining with `if` might not be branchless, but that’s acceptable. The ternary operation works as expected, and the threadgroup arrays seem okay. There’s a potential compile issue with `((LOGV) + 1u)` in the shift.
+**Evaluating code optimizations**
+
+I'm thinking about optimizing the code by using Stage64 directly without z shuffle. It seems like using zt[2+g] per lane could decrease the amount of code while improving speed. The incumbent zt appears to have improvements as well. For Stage16, using z directly as zt[8+(ltid>>4)] seems like a good plan. I’m considering making it more generic by removing the z broadcast and focusing on direct usage instead.

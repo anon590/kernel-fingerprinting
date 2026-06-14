@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.33689900830783004,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/00_seed.metal",
+    "elapsed_s": 0.11770486831665039,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3480917564016398,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/01_candidate.metal",
+    "elapsed_s": 18.240238904953003,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.33914027917250167,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/02_candidate.metal",
+    "elapsed_s": 22.057491064071655,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.27117774688676166,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/03_candidate.metal",
+    "elapsed_s": 20.807655096054077,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.27160687297626684,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/04_candidate.metal",
+    "elapsed_s": 18.553048849105835,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.28395414279500275,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/05_candidate.metal",
+    "elapsed_s": 20.639808654785156,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2643226366693955,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/06_candidate.metal",
+    "elapsed_s": 22.074198961257935,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2717164571121996,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/07_candidate.metal",
+    "elapsed_s": 21.97482395172119,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2719195189447148,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/08_candidate.metal",
+    "elapsed_s": 21.23084592819214,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.27421611003976226,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/09_candidate.metal",
+    "elapsed_s": 20.44218897819519,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.34734891712326,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_claude-opus-4-7_20260514_220908/10_candidate.metal",
+    "elapsed_s": 20.60874629020691,
+    "is_new_best": false
+  }
+]

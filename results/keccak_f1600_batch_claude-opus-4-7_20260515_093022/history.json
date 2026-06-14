@@ -1,0 +1,178 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.03928448315185816,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/00_seed.metal",
+    "elapsed_s": 17.394269943237305,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": false,
+    "score": null,
+    "fail_reason": "correctness failed at size sha3_256_B16K: bit_exact=65536",
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/01_candidate.metal",
+    "elapsed_s": 41.506041049957275,
+    "is_new_best": false
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.34332293778034695,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/02_candidate.metal",
+    "elapsed_s": 46.39548587799072,
+    "is_new_best": true
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.30244444577489676,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/03_candidate.metal",
+    "elapsed_s": 58.61495661735535,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.35939762940062103,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/04_candidate.metal",
+    "elapsed_s": 52.26667523384094,
+    "is_new_best": true
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3776191693522675,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/05_candidate.metal",
+    "elapsed_s": 50.42607307434082,
+    "is_new_best": true
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.38452581384184564,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/06_candidate.metal",
+    "elapsed_s": 50.66797184944153,
+    "is_new_best": true
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.47294261596443365,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/07_candidate.metal",
+    "elapsed_s": 55.82983374595642,
+    "is_new_best": true
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3817890738017575,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/08_candidate.metal",
+    "elapsed_s": 55.27774429321289,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3200972958052429,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/09_candidate.metal",
+    "elapsed_s": 53.95989203453064,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3424460885910696,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/10_candidate.metal",
+    "elapsed_s": 55.526280641555786,
+    "is_new_best": false
+  },
+  {
+    "iteration": 11,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.34554439795631214,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/11_candidate.metal",
+    "elapsed_s": 63.79655385017395,
+    "is_new_best": false
+  },
+  {
+    "iteration": 12,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.4386794955506668,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/12_candidate.metal",
+    "elapsed_s": 66.58610463142395,
+    "is_new_best": false
+  },
+  {
+    "iteration": 13,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.43445765332951325,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/13_candidate.metal",
+    "elapsed_s": 97.88590097427368,
+    "is_new_best": false
+  },
+  {
+    "iteration": 14,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.37781826313321903,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/14_candidate.metal",
+    "elapsed_s": 105.95401000976562,
+    "is_new_best": false
+  },
+  {
+    "iteration": 15,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3781993783173961,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_claude-opus-4-7_20260515_093022/15_candidate.metal",
+    "elapsed_s": 56.857908964157104,
+    "is_new_best": false
+  }
+]

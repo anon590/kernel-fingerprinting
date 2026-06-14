@@ -1,0 +1,3 @@
+**Analyzing lanes and outputs**
+
+I'm working through the logic of lane outputs. It looks like lane0 uses certain row and column references, outputting values c0 and c1. Meanwhile, lane1 operates differently; it uses another row reference, producing outputs c2 and c3. It’s interesting to see how they are structured and organized. I’m focusing on ensuring everything matches up correctly, so I can present the final results clearly for the user!

@@ -1,0 +1,7 @@
+{
+  "compile_ok": false,
+  "correct": false,
+  "score": null,
+  "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:28:17: error: lambda expressions are not supported in Metal\n    auto pack = [](uint v) {\n                ^\nprogram_source:42:19: error: lambda expressions are not supported in Metal\n    auto spread = [](uint v) -> uint {\n                  ^\n\" UserInfo={NSLocalizedDescription=program_source:28:17: error: lambda expressions are not supported in Metal\n    auto pack = [](uint v) {\n                ^\nprogram_source:42:19: error: lambda expressions are not supported in Metal\n    auto spread = [](uint v) -> uint {\n                  ^\n}",
+  "sizes": []
+}

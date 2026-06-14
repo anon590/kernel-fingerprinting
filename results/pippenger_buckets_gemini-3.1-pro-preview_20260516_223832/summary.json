@@ -1,0 +1,132 @@
+{
+  "task": "pippenger_buckets",
+  "model": "gemini-3.1-pro-preview",
+  "chip": "Apple M1 Pro",
+  "n_iterations": 10,
+  "seed_score": 0.0004153332584870956,
+  "best_score": 0.0028554095631195945,
+  "improvement": 6.87498413568128,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0004153332584870956,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/00_seed.metal",
+      "elapsed_s": 82.32905912399292,
+      "is_new_best": true
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": false,
+      "correct": false,
+      "score": null,
+      "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:335:24: error: no matching function for call to 'simd_broadcast'\n            ulong s0 = simd_broadcast(my_s, (ushort)(j + 0u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:336:24: error: no matching function for call to 'simd_broadcast'\n            ulong s1 = simd_broadcast(my_s, (ushort)(j + 1u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:337:24: error: no matching function for call to 'simd_broadcast'\n            ulong s2 = simd_broadcast(my_s, (ushort)(j + 2u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:338:24: error: no matching function for call to 'simd_broadcast'\n            ulong s3 = simd_broadcast(my_s, (ushort)(j + 3u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:339:24: error: no matching function for call to 'simd_broadcast'\n            ulong s4 = simd_broadcast(my_s, (ushort)(j + 4u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:340:24: error: no matching function for call to 'simd_broadcast'\n            ulong s5 = simd_broadcast(my_s, (ushort)(j + 5u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:341:24: error: no matching function for call to 'simd_broadcast'\n            ulong s6 = simd_broadcast(my_s, (ushort)(j + 6u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:342:24: error: no matching function for call to 'simd_broadcast'\n            ulong s7 = simd_broadcast(my_s, (ushort)(j + 7u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:385:24: error: no matching function for call to 'simd_broadcast'\n            ulong s0 = simd_broadcast(my_s, (ushort)j);\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\n\" UserInfo={NSLocalizedDescription=program_source:335:24: error: no matching function for call to 'simd_broadcast'\n            ulong s0 = simd_broadcast(my_s, (ushort)(j + 0u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:336:24: error: no matching function for call to 'simd_broadcast'\n            ulong s1 = simd_broadcast(my_s, (ushort)(j + 1u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:337:24: error: no matching function for call to 'simd_broadcast'\n            ulong s2 = simd_broadcast(my_s, (ushort)(j + 2u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:338:24: error: no matching function for call to 'simd_broadcast'\n            ulong s3 = simd_broadcast(my_s, (ushort)(j + 3u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:339:24: error: no matching function for call to 'simd_broadcast'\n            ulong s4 = simd_broadcast(my_s, (ushort)(j + 4u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:340:24: error: no matching function for call to 'simd_broadcast'\n            ulong s5 = simd_broadcast(my_s, (ushort)(j + 5u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:341:24: error: no matching function for call to 'simd_broadcast'\n            ulong s6 = simd_broadcast(my_s, (ushort)(j + 6u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:342:24: error: no matching function for call to 'simd_broadcast'\n            ulong s7 = simd_broadcast(my_s, (ushort)(j + 7u));\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\nprogram_source:385:24: error: no matching function for call to 'simd_broadcast'\n            ulong s0 = simd_broadcast(my_s, (ushort)j);\n                       ^~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:129:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_broadcast(T data METAL_MAYBE_UNDEF, ushort broadcast_lane_id)\n             ^\n}",
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/01_candidate.metal",
+      "elapsed_s": 283.1437327861786,
+      "is_new_best": false
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0017300673935013318,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/02_candidate.metal",
+      "elapsed_s": 270.2395658493042,
+      "is_new_best": true
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0025138921913871147,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/03_candidate.metal",
+      "elapsed_s": 313.0764756202698,
+      "is_new_best": true
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 3.9630114449598926e-05,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/04_candidate.metal",
+      "elapsed_s": 928.6522200107574,
+      "is_new_best": false
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.002682689325906194,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/05_candidate.metal",
+      "elapsed_s": 268.4794900417328,
+      "is_new_best": true
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0006816603634445952,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/06_candidate.metal",
+      "elapsed_s": 358.28988337516785,
+      "is_new_best": false
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.00031444798456740024,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/07_candidate.metal",
+      "elapsed_s": 369.7718040943146,
+      "is_new_best": false
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0028554095631195945,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/08_candidate.metal",
+      "elapsed_s": 292.3265359401703,
+      "is_new_best": true
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": false,
+      "score": null,
+      "fail_reason": "correctness failed at size uniform_N4K: bit_exact=2",
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/09_candidate.metal",
+      "elapsed_s": 267.46308612823486,
+      "is_new_best": false
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.00032688248388446756,
+      "fail_reason": null,
+      "source_path": "results/pippenger_buckets_gemini-3.1-pro-preview_20260516_223832/10_candidate.metal",
+      "elapsed_s": 296.1266198158264,
+      "is_new_best": false
+    }
+  ]
+}

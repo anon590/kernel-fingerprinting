@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.07723052060911632,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/00_seed.metal",
+    "elapsed_s": 77.84413409233093,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.325610072035793,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/01_candidate.metal",
+    "elapsed_s": 50.90627074241638,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.3369883064267558,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/02_candidate.metal",
+    "elapsed_s": 40.87583684921265,
+    "is_new_best": true
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": false,
+    "score": null,
+    "fail_reason": "correctness failed at size w16_C64K: bit_exact=131072",
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/03_candidate.metal",
+    "elapsed_s": 62.48464512825012,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.2887545534419655,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/04_candidate.metal",
+    "elapsed_s": 40.12133812904358,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.225989118083129,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/05_candidate.metal",
+    "elapsed_s": 46.26849389076233,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.2242432899518747,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/06_candidate.metal",
+    "elapsed_s": 47.811681270599365,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.2693820105078364,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/07_candidate.metal",
+    "elapsed_s": 72.26241207122803,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.2683146155749263,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/08_candidate.metal",
+    "elapsed_s": 64.1941831111908,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.2517746954941735,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/09_candidate.metal",
+    "elapsed_s": 82.67871737480164,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 1.258458518716115,
+    "fail_reason": null,
+    "source_path": "results/wots_chain_claude-opus-4-7_20260515_180734/10_candidate.metal",
+    "elapsed_s": 53.95861220359802,
+    "is_new_best": false
+  }
+]

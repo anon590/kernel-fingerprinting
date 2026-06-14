@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size f2_N64K: bit_exact=32767",
+  "sizes": [
+    {
+      "label": "f2_N64K",
+      "correct": false,
+      "error_value": 32767,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.001814770833334478,
+      "achieved": 6.12089460330923,
+      "achieved_unit": "Gmodmul/s (int64)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.1147400060859495
+    }
+  ]
+}

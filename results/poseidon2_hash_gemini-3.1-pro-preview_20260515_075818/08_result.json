@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size t3_B4K: bit_exact=12288",
+  "sizes": [
+    {
+      "label": "t3_B4K",
+      "correct": false,
+      "error_value": 12288,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00020524999854387715,
+      "achieved": 6.6054860395537105,
+      "achieved_unit": "Gmodmul/s (int64)",
+      "ceiling": 562.5,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.01174308629253993
+    }
+  ]
+}

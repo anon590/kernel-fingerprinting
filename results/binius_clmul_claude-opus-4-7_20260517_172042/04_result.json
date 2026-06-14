@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size gf128_N64K: bit_exact=127044",
+  "sizes": [
+    {
+      "label": "gf128_N64K",
+      "correct": false,
+      "error_value": 127044,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.002204104166594334,
+      "achieved": 7.611807215955348,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 577.4018126603683,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.013182859923636343
+    }
+  ]
+}

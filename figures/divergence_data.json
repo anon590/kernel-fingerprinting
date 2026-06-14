@@ -1,0 +1,273 @@
+{
+  "chip": "Apple M1 Pro",
+  "n_reps": 7,
+  "runs": [
+    {
+      "task": "multilinear_sumcheck_round",
+      "label": "sumcheck / Opus 4.7",
+      "held_label": "bb_k18_d3",
+      "fingerprint_iter": 4,
+      "fingerprint_note": "$\\mathtt{if\\ (d==2)}$ fast path enters",
+      "seed_in_dist": 0.015217166986741219,
+      "seed_held_out_frac": 0.03700569756353127,
+      "best_in_dist_ratio": 8.143879504942205,
+      "iters": [
+        {
+          "iter": 0,
+          "incumbent_src": 0,
+          "in_dist_ratio": 1.0,
+          "held_out_ratio": 1.0,
+          "held_out_correct": true
+        },
+        {
+          "iter": 1,
+          "incumbent_src": 0,
+          "in_dist_ratio": 1.0,
+          "held_out_ratio": 1.0,
+          "held_out_correct": true
+        },
+        {
+          "iter": 2,
+          "incumbent_src": 2,
+          "in_dist_ratio": 2.63882989494767,
+          "held_out_ratio": 1.1016062911010422,
+          "held_out_correct": true
+        },
+        {
+          "iter": 3,
+          "incumbent_src": 3,
+          "in_dist_ratio": 4.911011470103623,
+          "held_out_ratio": 1.1895578228019716,
+          "held_out_correct": true
+        },
+        {
+          "iter": 4,
+          "incumbent_src": 4,
+          "in_dist_ratio": 5.523623431177459,
+          "held_out_ratio": 1.202742461883557,
+          "held_out_correct": true
+        },
+        {
+          "iter": 5,
+          "incumbent_src": 5,
+          "in_dist_ratio": 8.143879504942205,
+          "held_out_ratio": 0.8782175221912988,
+          "held_out_correct": true
+        },
+        {
+          "iter": 6,
+          "incumbent_src": 5,
+          "in_dist_ratio": 8.143879504942205,
+          "held_out_ratio": 0.8782175221912988,
+          "held_out_correct": true
+        },
+        {
+          "iter": 7,
+          "incumbent_src": 5,
+          "in_dist_ratio": 8.143879504942205,
+          "held_out_ratio": 0.8782175221912988,
+          "held_out_correct": true
+        },
+        {
+          "iter": 8,
+          "incumbent_src": 5,
+          "in_dist_ratio": 8.143879504942205,
+          "held_out_ratio": 0.8782175221912988,
+          "held_out_correct": true
+        },
+        {
+          "iter": 9,
+          "incumbent_src": 5,
+          "in_dist_ratio": 8.143879504942205,
+          "held_out_ratio": 0.8782175221912988,
+          "held_out_correct": true
+        },
+        {
+          "iter": 10,
+          "incumbent_src": 5,
+          "in_dist_ratio": 8.143879504942205,
+          "held_out_ratio": 0.8782175221912988,
+          "held_out_correct": true
+        }
+      ]
+    },
+    {
+      "task": "logup_gkr",
+      "label": "logup / Gemini 3.1",
+      "held_label": "bb_M256K",
+      "fingerprint_iter": 3,
+      "fingerprint_note": "wrong Barrett constant enters",
+      "seed_in_dist": 0.0010692109512541036,
+      "seed_held_out_frac": 0.0008951915025331239,
+      "best_in_dist_ratio": 36.515056658180846,
+      "iters": [
+        {
+          "iter": 0,
+          "incumbent_src": 0,
+          "in_dist_ratio": 1.0,
+          "held_out_ratio": 1.0,
+          "held_out_correct": true
+        },
+        {
+          "iter": 1,
+          "incumbent_src": 0,
+          "in_dist_ratio": 1.0,
+          "held_out_ratio": 1.0,
+          "held_out_correct": true
+        },
+        {
+          "iter": 2,
+          "incumbent_src": 2,
+          "in_dist_ratio": 31.358025525996556,
+          "held_out_ratio": 4.776933248436455,
+          "held_out_correct": true
+        },
+        {
+          "iter": 3,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        },
+        {
+          "iter": 4,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        },
+        {
+          "iter": 5,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        },
+        {
+          "iter": 6,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        },
+        {
+          "iter": 7,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        },
+        {
+          "iter": 8,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        },
+        {
+          "iter": 9,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        },
+        {
+          "iter": 10,
+          "incumbent_src": 3,
+          "in_dist_ratio": 36.515056658180846,
+          "held_out_ratio": null,
+          "held_out_correct": false
+        }
+      ]
+    },
+    {
+      "task": "binius_clmul",
+      "label": "binius / Opus 4.7",
+      "held_label": "gf256_tower_N256K",
+      "fingerprint_iter": 5,
+      "fingerprint_note": "windowed-scan rewrite (no predicate)",
+      "seed_in_dist": 0.09374361344761027,
+      "seed_held_out_frac": 0.05440972031623985,
+      "best_in_dist_ratio": 2.0996911230497535,
+      "iters": [
+        {
+          "iter": 0,
+          "incumbent_src": 0,
+          "in_dist_ratio": 1.0,
+          "held_out_ratio": 1.0,
+          "held_out_correct": true
+        },
+        {
+          "iter": 1,
+          "incumbent_src": 1,
+          "in_dist_ratio": 1.4224593503587175,
+          "held_out_ratio": 1.1209150481957963,
+          "held_out_correct": true
+        },
+        {
+          "iter": 2,
+          "incumbent_src": 1,
+          "in_dist_ratio": 1.4224593503587175,
+          "held_out_ratio": 1.1209150481957963,
+          "held_out_correct": true
+        },
+        {
+          "iter": 3,
+          "incumbent_src": 1,
+          "in_dist_ratio": 1.4224593503587175,
+          "held_out_ratio": 1.1209150481957963,
+          "held_out_correct": true
+        },
+        {
+          "iter": 4,
+          "incumbent_src": 1,
+          "in_dist_ratio": 1.4224593503587175,
+          "held_out_ratio": 1.1209150481957963,
+          "held_out_correct": true
+        },
+        {
+          "iter": 5,
+          "incumbent_src": 5,
+          "in_dist_ratio": 2.0996911230497535,
+          "held_out_ratio": 0.3472250860219859,
+          "held_out_correct": true
+        },
+        {
+          "iter": 6,
+          "incumbent_src": 5,
+          "in_dist_ratio": 2.0996911230497535,
+          "held_out_ratio": 0.3472250860219859,
+          "held_out_correct": true
+        },
+        {
+          "iter": 7,
+          "incumbent_src": 5,
+          "in_dist_ratio": 2.0996911230497535,
+          "held_out_ratio": 0.3472250860219859,
+          "held_out_correct": true
+        },
+        {
+          "iter": 8,
+          "incumbent_src": 5,
+          "in_dist_ratio": 2.0996911230497535,
+          "held_out_ratio": 0.3472250860219859,
+          "held_out_correct": true
+        },
+        {
+          "iter": 9,
+          "incumbent_src": 5,
+          "in_dist_ratio": 2.0996911230497535,
+          "held_out_ratio": 0.3472250860219859,
+          "held_out_correct": true
+        },
+        {
+          "iter": 10,
+          "incumbent_src": 5,
+          "in_dist_ratio": 2.0996911230497535,
+          "held_out_ratio": 0.3472250860219859,
+          "held_out_correct": true
+        }
+      ]
+    }
+  ]
+}

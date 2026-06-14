@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": true,
+  "score": 0.028415924429327454,
+  "fail_reason": null,
+  "sizes": [
+    {
+      "label": "t3_B4K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0002155833317374345,
+      "achieved": 6.288872099125181,
+      "achieved_unit": "Gmodmul/s (int64)",
+      "ceiling": 562.5,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.011180217065111433
+    },
+    {
+      "label": "t3_B64K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0009408541627635714,
+      "achieved": 23.05608760478123,
+      "achieved_unit": "Gmodmul/s (int64)",
+      "ceiling": 562.5,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.04098860018627774
+    },
+    {
+      "label": "t3_B1M",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.012323479168117046,
+      "achieved": 28.164015312976876,
+      "achieved_unit": "Gmodmul/s (int64)",
+      "ceiling": 562.5,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.05006936055640333
+    }
+  ]
+}

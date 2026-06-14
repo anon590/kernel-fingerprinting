@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.015217166986741219,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/00_seed.metal",
+    "elapsed_s": 0.2828242778778076,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": false,
+    "correct": false,
+    "score": null,
+    "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:162:27: error: no matching function for call to 'simd_shuffle_xor'\n            ulong other = simd_shuffle_xor(v, off);\n                          ^~~~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:267:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_shuffle_xor(T data METAL_MAYBE_UNDEF, ushort mask)\n             ^\nprogram_source:177:31: error: no matching function for call to 'simd_shuffle_xor'\n                ulong other = simd_shuffle_xor(v, off);\n                              ^~~~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:267:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_shuffle_xor(T data METAL_MAYBE_UNDEF, ushort mask)\n             ^\n\" UserInfo={NSLocalizedDescription=program_source:162:27: error: no matching function for call to 'simd_shuffle_xor'\n            ulong other = simd_shuffle_xor(v, off);\n                          ^~~~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:267:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_shuffle_xor(T data METAL_MAYBE_UNDEF, ushort mask)\n             ^\nprogram_source:177:31: error: no matching function for call to 'simd_shuffle_xor'\n                ulong other = simd_shuffle_xor(v, off);\n                              ^~~~~~~~~~~~~~~~\n/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/Libraries/lib/clang/32023.883/include/metal/metal_simdgroup:267:14: note: candidate template ignored: requirement '__is_valid_simdgroup_type<unsigned long, void>::value' was not satisfied [with T = unsigned long]\nMETAL_FUNC T simd_shuffle_xor(T data METAL_MAYBE_UNDEF, ushort mask)\n             ^\n}",
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/01_candidate.metal",
+    "elapsed_s": 42.284366846084595,
+    "is_new_best": false
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.04015551516102348,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/02_candidate.metal",
+    "elapsed_s": 37.557157039642334,
+    "is_new_best": true
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.07473168161436831,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/03_candidate.metal",
+    "elapsed_s": 50.03629493713379,
+    "is_new_best": true
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.08405390012410388,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/04_candidate.metal",
+    "elapsed_s": 46.707337617874146,
+    "is_new_best": true
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.12392677434660494,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/05_candidate.metal",
+    "elapsed_s": 50.49146842956543,
+    "is_new_best": true
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.07943028526611749,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/06_candidate.metal",
+    "elapsed_s": 48.9504816532135,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.1070833109504676,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/07_candidate.metal",
+    "elapsed_s": 61.045257329940796,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.10431015507014114,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/08_candidate.metal",
+    "elapsed_s": 49.48871088027954,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.08398428740641109,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/09_candidate.metal",
+    "elapsed_s": 49.76295018196106,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.08939438620438186,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_claude-opus-4-7_20260517_173349/10_candidate.metal",
+    "elapsed_s": 48.60323882102966,
+    "is_new_best": false
+  }
+]

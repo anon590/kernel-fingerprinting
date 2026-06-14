@@ -1,0 +1,134 @@
+
+=== Metal kernel evolution: task=keccak_f1600_batch ===
+  model: gpt-5.5
+  chip:  Apple M1 Pro (peak 4500 GFLOPS fp32, 53 Gops/s int64 mul [est], 200 GB/s DRAM)
+  timing: n_warmup=3, n_measure=10, n_reps=3
+  output: results/keccak_f1600_batch_gpt-5.5_20260516_191646
+
+[seed] Evaluating seed kernel...
+  seed score: 0.0764  (17.4s)
+
+--- iteration 1/15 ---
+  [llm] OpenAI tokens: in=3949, out=10329
+  generated in 165.1s; evaluating...
+  score = 0.6788 (seed = 0.0764, best = 0.0764)
+       sha3_256_B16K:    0.37 ms,   162.9 Gbitops/s (u64) (28.2%)  [reps 0.37-0.37 ms]
+      sha3_256_B256K:    1.86 ms,   525.6 Gbitops/s (u64) (91.0%)  [reps 1.83-1.91 ms]
+        sha3_256_B4M:   22.18 ms,   703.4 Gbitops/s (u64) (121.8%)  [reps 22.08-22.19 ms]
+  NEW INCUMBENT
+
+--- iteration 2/15 ---
+  [llm] OpenAI tokens: in=6573, out=14469
+  generated in 256.1s; evaluating...
+  score = 0.6501 (seed = 0.0764, best = 0.6788)
+       sha3_256_B16K:    0.35 ms,   175.9 Gbitops/s (u64) (30.5%)  [reps 0.35-0.35 ms]
+      sha3_256_B256K:    2.32 ms,   420.1 Gbitops/s (u64) (72.8%)  [reps 2.08-2.36 ms]
+        sha3_256_B4M:   21.81 ms,   715.5 Gbitops/s (u64) (123.9%)  [reps 21.81-21.81 ms]
+
+--- iteration 3/15 ---
+  [llm] OpenAI tokens: in=11989, out=19838
+  generated in 375.1s; evaluating...
+  score = 0.6673 (seed = 0.0764, best = 0.6788)
+       sha3_256_B16K:    0.37 ms,   165.7 Gbitops/s (u64) (28.7%)  [reps 0.37-0.37 ms]
+      sha3_256_B256K:    2.05 ms,   476.1 Gbitops/s (u64) (82.5%)  [reps 1.84-2.30 ms]
+        sha3_256_B4M:   21.52 ms,   725.0 Gbitops/s (u64) (125.6%)  [reps 21.52-21.53 ms]
+
+--- iteration 4/15 ---
+  [llm] OpenAI tokens: in=10864, out=15200
+  generated in 261.3s; evaluating...
+  score = 0.6340 (seed = 0.0764, best = 0.6788)
+       sha3_256_B16K:    0.36 ms,   169.9 Gbitops/s (u64) (29.4%)  [reps 0.36-0.36 ms]
+      sha3_256_B256K:    2.35 ms,   414.3 Gbitops/s (u64) (71.8%)  [reps 2.34-2.43 ms]
+        sha3_256_B4M:   22.38 ms,   697.1 Gbitops/s (u64) (120.7%)  [reps 22.37-22.44 ms]
+
+--- iteration 5/15 ---
+  [llm] OpenAI tokens: in=12202, out=19398
+  generated in 342.4s; evaluating...
+  score = 0.6773 (seed = 0.0764, best = 0.6788)
+       sha3_256_B16K:    0.36 ms,   170.9 Gbitops/s (u64) (29.6%)  [reps 0.36-0.36 ms]
+      sha3_256_B256K:    1.94 ms,   503.5 Gbitops/s (u64) (87.2%)  [reps 1.93-2.00 ms]
+        sha3_256_B4M:   22.44 ms,   695.2 Gbitops/s (u64) (120.4%)  [reps 22.44-22.44 ms]
+
+--- iteration 6/15 ---
+  [llm] OpenAI tokens: in=13165, out=17408
+  generated in 281.7s; evaluating...
+  score = 0.6313 (seed = 0.0764, best = 0.6788)
+       sha3_256_B16K:    0.36 ms,   171.0 Gbitops/s (u64) (29.6%)  [reps 0.36-0.36 ms]
+      sha3_256_B256K:    2.41 ms,   403.8 Gbitops/s (u64) (69.9%)  [reps 1.99-2.55 ms]
+        sha3_256_B4M:   22.24 ms,   701.5 Gbitops/s (u64) (121.5%)  [reps 22.21-22.25 ms]
+
+--- iteration 7/15 ---
+  [llm] OpenAI tokens: in=12473, out=15137
+  generated in 243.5s; evaluating...
+  score = 0.6679 (seed = 0.0764, best = 0.6788)
+       sha3_256_B16K:    0.36 ms,   171.5 Gbitops/s (u64) (29.7%)  [reps 0.36-0.36 ms]
+      sha3_256_B256K:    2.04 ms,   478.0 Gbitops/s (u64) (82.8%)  [reps 1.93-2.70 ms]
+        sha3_256_B4M:   22.30 ms,   699.7 Gbitops/s (u64) (121.2%)  [reps 22.30-22.32 ms]
+
+--- iteration 8/15 ---
+  [llm] OpenAI tokens: in=12380, out=16927
+  generated in 314.0s; evaluating...
+  score = 0.6946 (seed = 0.0764, best = 0.6788)
+       sha3_256_B16K:    0.35 ms,   173.1 Gbitops/s (u64) (30.0%)  [reps 0.35-0.35 ms]
+      sha3_256_B256K:    1.94 ms,   501.5 Gbitops/s (u64) (86.9%)  [reps 1.79-2.23 ms]
+        sha3_256_B4M:   21.00 ms,   743.1 Gbitops/s (u64) (128.7%)  [reps 21.00-21.00 ms]
+  NEW INCUMBENT
+
+--- iteration 9/15 ---
+  [llm] OpenAI tokens: in=7079, out=21604
+  generated in 389.2s; evaluating...
+  score = 0.6622 (seed = 0.0764, best = 0.6946)
+       sha3_256_B16K:    0.32 ms,   190.1 Gbitops/s (u64) (32.9%)  [reps 0.32-0.32 ms]
+      sha3_256_B256K:    2.36 ms,   412.4 Gbitops/s (u64) (71.4%)  [reps 1.89-2.37 ms]
+        sha3_256_B4M:   21.89 ms,   712.7 Gbitops/s (u64) (123.4%)  [reps 21.80-21.93 ms]
+
+--- iteration 10/15 ---
+  [llm] OpenAI tokens: in=13881, out=17679
+  generated in 326.9s; evaluating...
+  score = 0.6915 (seed = 0.0764, best = 0.6946)
+       sha3_256_B16K:    0.35 ms,   174.2 Gbitops/s (u64) (30.2%)  [reps 0.35-0.35 ms]
+      sha3_256_B256K:    1.98 ms,   493.1 Gbitops/s (u64) (85.4%)  [reps 1.96-2.23 ms]
+        sha3_256_B4M:   21.06 ms,   741.0 Gbitops/s (u64) (128.3%)  [reps 21.04-21.16 ms]
+
+--- iteration 11/15 ---
+  [llm] OpenAI tokens: in=12684, out=23636
+  generated in 385.3s; evaluating...
+  score = 0.7010 (seed = 0.0764, best = 0.6946)
+       sha3_256_B16K:    0.32 ms,   192.0 Gbitops/s (u64) (33.3%)  [reps 0.32-0.32 ms]
+      sha3_256_B256K:    2.03 ms,   481.3 Gbitops/s (u64) (83.4%)  [reps 1.99-2.37 ms]
+        sha3_256_B4M:   21.74 ms,   717.5 Gbitops/s (u64) (124.3%)  [reps 21.73-21.79 ms]
+  NEW INCUMBENT
+
+--- iteration 12/15 ---
+  [llm] OpenAI tokens: in=11208, out=22148
+  generated in 346.0s; evaluating...
+  score = 0.6655 (seed = 0.0764, best = 0.7010)
+       sha3_256_B16K:    0.32 ms,   191.7 Gbitops/s (u64) (33.2%)  [reps 0.32-0.32 ms]
+      sha3_256_B256K:    2.36 ms,   412.9 Gbitops/s (u64) (71.5%)  [reps 2.04-2.60 ms]
+        sha3_256_B4M:   21.76 ms,   717.0 Gbitops/s (u64) (124.2%)  [reps 21.75-21.82 ms]
+
+--- iteration 13/15 ---
+  [llm] OpenAI tokens: in=22571, out=21890
+  generated in 397.7s; evaluating...
+  score = 0.6464 (seed = 0.0764, best = 0.7010)
+       sha3_256_B16K:    0.35 ms,   176.0 Gbitops/s (u64) (30.5%)  [reps 0.35-0.35 ms]
+      sha3_256_B256K:    2.36 ms,   413.2 Gbitops/s (u64) (71.6%)  [reps 1.95-2.53 ms]
+        sha3_256_B4M:   21.82 ms,   715.2 Gbitops/s (u64) (123.9%)  [reps 21.76-21.84 ms]
+
+--- iteration 14/15 ---
+  [llm] OpenAI tokens: in=20265, out=18723
+  generated in 308.5s; evaluating...
+  score = 0.6625 (seed = 0.0764, best = 0.7010)
+       sha3_256_B16K:    0.35 ms,   174.8 Gbitops/s (u64) (30.3%)  [reps 0.35-0.35 ms]
+      sha3_256_B256K:    2.18 ms,   447.4 Gbitops/s (u64) (77.5%)  [reps 1.90-2.36 ms]
+        sha3_256_B4M:   21.80 ms,   715.6 Gbitops/s (u64) (123.9%)  [reps 21.80-21.83 ms]
+
+--- iteration 15/15 ---
+  [llm] OpenAI tokens: in=20370, out=21030
+  generated in 448.5s; evaluating...
+  score = 0.6694 (seed = 0.0764, best = 0.7010)
+       sha3_256_B16K:    0.32 ms,   191.1 Gbitops/s (u64) (33.1%)  [reps 0.32-0.32 ms]
+      sha3_256_B256K:    2.31 ms,   422.0 Gbitops/s (u64) (73.1%)  [reps 1.88-2.40 ms]
+        sha3_256_B4M:   21.79 ms,   716.0 Gbitops/s (u64) (124.0%)  [reps 21.78-21.80 ms]
+
+=== done. seed=0.0764, best=0.7010, output=results/keccak_f1600_batch_gpt-5.5_20260516_191646 ===

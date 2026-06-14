@@ -1,0 +1,21 @@
+{
+  "task": "keccak_f1600_batch",
+  "redactions": [
+    {
+      "find": "In-distribution sizes use the SHA3-256 mode (rate=136, domain=0x06, out=32); the held-out size uses SHAKE128 (rate=168, domain=0x1F, out=256, requires multiple squeeze permutations). The kernel must use the runtime values of ``rate_bytes``, ``out_bytes`` and ``domain`` rather than compile-time constants.",
+      "replace": "The baseline sizes below use the SHA3-256 mode (rate=136, domain=0x06, out=32). The kernel is scored on several (rate_bytes, out_bytes, domain) parameter sets, including configurations not listed among the baseline sizes, and out_bytes may exceed rate_bytes. The kernel must use the runtime values of ``rate_bytes``, ``out_bytes`` and ``domain`` rather than compile-time constants.",
+      "note": "removes SHAKE128 held-out identity; keeps generic runtime contract",
+      "n_matches": 1,
+      "where": [
+        "description"
+      ]
+    }
+  ],
+  "denylist": [
+    "SHAKE128",
+    "rate=168",
+    "domain=0x1F",
+    "out=256",
+    "held-out"
+  ]
+}

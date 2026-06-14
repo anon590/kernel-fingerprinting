@@ -1,0 +1,176 @@
+{
+  "task": "wots_chain",
+  "model": "gpt-5.5",
+  "chip": "Apple M1 Pro",
+  "redacted": true,
+  "model_named_held_out": [
+    "n_bytes=32"
+  ],
+  "model_named_held_out_iterations": [
+    5
+  ],
+  "n_iterations": 12,
+  "seed_score": 0.03934275208164821,
+  "best_score": 0.8130171467106402,
+  "improvement": 20.66497902900594,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.03934275208164821,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/00_seed.metal",
+      "elapsed_s": 77.85098814964294,
+      "is_new_best": true,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6210732308823792,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/01_candidate.metal",
+      "elapsed_s": 322.44627022743225,
+      "is_new_best": true,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6402770966318182,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/02_candidate.metal",
+      "elapsed_s": 317.22502636909485,
+      "is_new_best": true,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6363022834872183,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/03_candidate.metal",
+      "elapsed_s": 389.2311420440674,
+      "is_new_best": false,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6426646689906004,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/04_candidate.metal",
+      "elapsed_s": 374.3301601409912,
+      "is_new_best": true,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6327562516367025,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/05_candidate.metal",
+      "elapsed_s": 328.685617685318,
+      "is_new_best": false,
+      "model_named_held_out": [
+        "n_bytes=32"
+      ]
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6325826358360042,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/06_candidate.metal",
+      "elapsed_s": 319.213586807251,
+      "is_new_best": false,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6367353383986895,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/07_candidate.metal",
+      "elapsed_s": 377.3226499557495,
+      "is_new_best": false,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6311390152826103,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/08_candidate.metal",
+      "elapsed_s": 465.0596570968628,
+      "is_new_best": false,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.616311213480678,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/09_candidate.metal",
+      "elapsed_s": 318.38787722587585,
+      "is_new_best": false,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.6352070213542641,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/10_candidate.metal",
+      "elapsed_s": 263.46153593063354,
+      "is_new_best": false,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 11,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.8130171467106402,
+      "fail_reason": null,
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/11_candidate.metal",
+      "elapsed_s": 396.5505118370056,
+      "is_new_best": true,
+      "model_named_held_out": []
+    },
+    {
+      "iteration": 12,
+      "role": "skipped",
+      "compile_ok": false,
+      "correct": false,
+      "score": null,
+      "fail_reason": "no metal block in response",
+      "source_path": "/Users/anon/metal-zk/results/redaction_experiment/wots_chain_gpt-5.5_20260609_134909_redacted/12_response.md",
+      "elapsed_s": 391.4386522769928,
+      "is_new_best": false,
+      "model_named_held_out": []
+    }
+  ]
+}

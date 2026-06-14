@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.404984691100057,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/00_seed.metal",
+    "elapsed_s": 0.24797415733337402,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2540411746181689,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/01_candidate.metal",
+    "elapsed_s": 336.6519629955292,
+    "is_new_best": false
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2652357240858739,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/02_candidate.metal",
+    "elapsed_s": 230.49475026130676,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2592166484198962,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/03_candidate.metal",
+    "elapsed_s": 378.84387254714966,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.26001788777791823,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/04_candidate.metal",
+    "elapsed_s": 490.0667381286621,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.25942034018539134,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/05_candidate.metal",
+    "elapsed_s": 355.2117624282837,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.24440839677068896,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/06_candidate.metal",
+    "elapsed_s": 554.6771953105927,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.26346747757121947,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/07_candidate.metal",
+    "elapsed_s": 338.9607980251312,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3094244760068847,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/08_candidate.metal",
+    "elapsed_s": 339.6959888935089,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.24076953500721077,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/09_candidate.metal",
+    "elapsed_s": 489.8304922580719,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3144071671453436,
+    "fail_reason": null,
+    "source_path": "results/goldilocks_ntt_gpt-5.5_20260516_181241/10_candidate.metal",
+    "elapsed_s": 329.89979362487793,
+    "is_new_best": false
+  }
+]

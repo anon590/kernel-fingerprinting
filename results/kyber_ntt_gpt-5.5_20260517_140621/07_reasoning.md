@@ -1,0 +1,3 @@
+**Considering scratch locations**
+
+I need to make sure I'm using distinct scratch locations for stage 1 output so they don't overlap with the necessary values from stage 0. It sounds smarter to use a different half of the scratch space for the stage 1 output rather than adding extra barriers after reads. I have an array of size 256, so I think that will give me enough room to avoid any issues in managing the outputs.

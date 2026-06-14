@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.252303523944502,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/00_seed.metal",
+    "elapsed_s": 1.3610029220581055,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2570927702957165,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/01_candidate.metal",
+    "elapsed_s": 520.6885230541229,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.23131610446859868,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/02_candidate.metal",
+    "elapsed_s": 344.43026518821716,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.26122167859468104,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/03_candidate.metal",
+    "elapsed_s": 303.0108160972595,
+    "is_new_best": true
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2619084739917388,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/04_candidate.metal",
+    "elapsed_s": 429.1050498485565,
+    "is_new_best": true
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2651175040412264,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/05_candidate.metal",
+    "elapsed_s": 390.7658598423004,
+    "is_new_best": true
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2604154390592735,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/06_candidate.metal",
+    "elapsed_s": 315.4451231956482,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.28345143284094326,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/07_candidate.metal",
+    "elapsed_s": 258.4811141490936,
+    "is_new_best": true
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.30809991488299837,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/08_candidate.metal",
+    "elapsed_s": 403.04703879356384,
+    "is_new_best": true
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.33144849423806744,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/09_candidate.metal",
+    "elapsed_s": 345.5706961154938,
+    "is_new_best": true
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.3372171028790217,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gpt-5.5_20260518_134705/10_candidate.metal",
+    "elapsed_s": 311.9202194213867,
+    "is_new_best": true
+  }
+]

@@ -1,0 +1,19 @@
+=== STARTING 03_gemini_montgomery_msm 2026-05-16T14:16:11Z ===
+    cmd: uv run run_benchmark.py --task montgomery_msm --model gemini-3.1-pro-preview --iterations 10
+=== FINISHED 03_gemini_montgomery_msm rc=0 dt=4173s 2026-05-16T15:25:44Z ===
+=== STARTING 04_gemini_wots_chain 2026-05-16T15:25:44Z ===
+    cmd: uv run run_benchmark.py --task wots_chain --model gemini-3.1-pro-preview --iterations 10
+=== FINISHED 04_gemini_wots_chain rc=0 dt=2817s 2026-05-16T16:12:41Z ===
+=== STARTING 05_gpt55_goldilocks_ntt 2026-05-16T16:12:41Z ===
+    cmd: uv run run_benchmark.py --task goldilocks_ntt --model gpt-5.5 --iterations 10
+=== FINISHED 05_gpt55_goldilocks_ntt rc=0 dt=3845s 2026-05-16T17:16:46Z ===
+=== STARTING 06_gpt55_keccak_f1600_batch 2026-05-16T17:16:46Z ===
+    cmd: uv run run_benchmark.py --task keccak_f1600_batch --model gpt-5.5 --iterations 15
+=== FINISHED 06_gpt55_keccak_f1600_batch rc=0 dt=4925s 2026-05-16T18:38:51Z ===
+=== STARTING 07_gpt55_merkle_build 2026-05-16T18:38:51Z ===
+    cmd: uv run run_benchmark.py --task merkle_build --model gpt-5.5 --iterations 10
+=== FINISHED 07_gpt55_merkle_build rc=0 dt=3544s 2026-05-16T19:37:55Z ===
+=== STARTING 08_gpt55_poseidon2_hash 2026-05-16T19:37:55Z ===
+    cmd: uv run run_benchmark.py --task poseidon2_hash --model gpt-5.5 --iterations 10
+=== FINISHED 08_gpt55_poseidon2_hash rc=0 dt=3508s 2026-05-16T20:36:23Z ===
+=== SWEEP COMPLETE 2026-05-16T20:36:23Z ===

@@ -1,0 +1,44 @@
+{
+  "compile_ok": true,
+  "correct": true,
+  "score": 0.8430644752236637,
+  "fail_reason": null,
+  "sizes": [
+    {
+      "label": "sha3_256_B16K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00019139582946081646,
+      "achieved": 318.4420484589383,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 578.3364289365937,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.5506173094516426
+    },
+    {
+      "label": "sha3_256_B256K",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.0019183333351975307,
+      "achieved": 508.3452714434461,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 578.3364289365937,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.8789784734434891
+    },
+    {
+      "label": "sha3_256_B4M",
+      "correct": true,
+      "error_value": 0,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.021790541664813645,
+      "achieved": 716.035935223891,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 578.3364289365937,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 1.2380958545884615
+    }
+  ]
+}

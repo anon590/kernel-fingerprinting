@@ -1,0 +1,7 @@
+{
+  "compile_ok": false,
+  "correct": false,
+  "score": null,
+  "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:62:24: error: use of undeclared identifier 'H_placeholder'\n    ulong low_part = ((H_placeholder()) << 32); // placeholder removed below\n                       ^\n\" UserInfo={NSLocalizedDescription=program_source:62:24: error: use of undeclared identifier 'H_placeholder'\n    ulong low_part = ((H_placeholder()) << 32); // placeholder removed below\n                       ^\n}",
+  "sizes": []
+}

@@ -1,0 +1,7 @@
+{
+  "compile_ok": false,
+  "correct": false,
+  "score": null,
+  "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:197:23: error: lambda expressions are not supported in Metal\n    auto matvec_ext = [&](thread ulong *st) {\n                      ^\nprogram_source:204:23: error: lambda expressions are not supported in Metal\n    auto matvec_int = [&](thread ulong *st) {\n                      ^\n\" UserInfo={NSLocalizedDescription=program_source:197:23: error: lambda expressions are not supported in Metal\n    auto matvec_ext = [&](thread ulong *st) {\n                      ^\nprogram_source:204:23: error: lambda expressions are not supported in Metal\n    auto matvec_int = [&](thread ulong *st) {\n                      ^\n}",
+  "sizes": []
+}

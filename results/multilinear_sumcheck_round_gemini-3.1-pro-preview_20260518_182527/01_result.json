@@ -1,0 +1,7 @@
+{
+  "compile_ok": false,
+  "correct": false,
+  "score": null,
+  "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:159:5: error: variables in the threadgroup address space cannot be declared in a non-qualified function\n    threadgroup ulong scratch[32];\n    ^\n\" UserInfo={NSLocalizedDescription=program_source:159:5: error: variables in the threadgroup address space cannot be declared in a non-qualified function\n    threadgroup ulong scratch[32];\n    ^\n}",
+  "sizes": []
+}

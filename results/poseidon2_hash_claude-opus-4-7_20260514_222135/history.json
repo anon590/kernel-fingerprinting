@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.021099312837649573,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/00_seed.metal",
+    "elapsed_s": 87.14643621444702,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.026071433111135436,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/01_candidate.metal",
+    "elapsed_s": 122.09724688529968,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": false,
+    "correct": false,
+    "score": null,
+    "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:96:10: error: cannot combine with previous 'type-name' declaration specifier\n    uint half = rf >> 1u;\n         ^\nprogram_source:96:15: error: expected unqualified-id\n    uint half = rf >> 1u;\n              ^\nprogram_source:161:34: error: expected '(' for function-style cast or type construction\n        for (uint r = 0; r < half; ++r) {\n                             ~~~~^\nprogram_source:185:27: error: expected '(' for function-style cast or type construction\n        for (uint r = half; r < rf; ++r) {\n                      ~~~~^\nprogram_source:233:30: error: expected '(' for function-style cast or type construction\n    for (uint r = 0; r < half; ++r) {\n                         ~~~~^\nprogram_source:278:23: error: expected '(' for function-style cast or type construction\n    for (uint r = half; r < rf; ++r) {\n                  ~~~~^\n\" UserInfo={NSLocalizedDescription=program_source:96:10: error: cannot combine with previous 'type-name' declaration specifier\n    uint half = rf >> 1u;\n         ^\nprogram_source:96:15: error: expected unqualified-id\n    uint half = rf >> 1u;\n              ^\nprogram_source:161:34: error: expected '(' for function-style cast or type construction\n        for (uint r = 0; r < half; ++r) {\n                             ~~~~^\nprogram_source:185:27: error: expected '(' for function-style cast or type construction\n        for (uint r = half; r < rf; ++r) {\n                      ~~~~^\nprogram_source:233:30: error: expected '(' for function-style cast or type construction\n    for (uint r = 0; r < half; ++r) {\n                         ~~~~^\nprogram_source:278:23: error: expected '(' for function-style cast or type construction\n    for (uint r = half; r < rf; ++r) {\n                  ~~~~^\n}",
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/02_candidate.metal",
+    "elapsed_s": 61.49537801742554,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.02667441386821328,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/03_candidate.metal",
+    "elapsed_s": 136.18235158920288,
+    "is_new_best": true
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.02370255014602819,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/04_candidate.metal",
+    "elapsed_s": 143.7862732410431,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.026177034865347528,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/05_candidate.metal",
+    "elapsed_s": 148.61686086654663,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.025417635034367246,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/06_candidate.metal",
+    "elapsed_s": 139.84188890457153,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.031473058043854765,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/07_candidate.metal",
+    "elapsed_s": 148.22967910766602,
+    "is_new_best": true
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.02507785824393393,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/08_candidate.metal",
+    "elapsed_s": 143.9225549697876,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.02889985787416912,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/09_candidate.metal",
+    "elapsed_s": 159.27907609939575,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.028731149675270313,
+    "fail_reason": null,
+    "source_path": "results/poseidon2_hash_claude-opus-4-7_20260514_222135/10_candidate.metal",
+    "elapsed_s": 141.43191981315613,
+    "is_new_best": false
+  }
+]

@@ -1,0 +1,5 @@
+I'll optimize by fusing multiple butterfly stages within a threadgroup using shared memory. The host launches one kernel per stage, but I can't change that contract. Instead, I'll focus on optimizing the single-stage kernel further.
+
+Key insight: the main cost beyond memory is `gold_mul`. Looking at the reduction more carefully, I can simplify it. Also, for stage 0, the twiddle is always `tw[k * (N/2)]`... wait, no — at stage 0, `r=0` always (mask=0), so `w=tw[0]=1`, meaning we can skip multiplication entirely. Similarly, the `gold_canonical` final step can be merged.
+
+I'll: (1) special-case stage 0 to skip the multiply (w=1), (2) tighten `gold_reduce128` by removing the final canonicalize when not needed by using a tighter bound, (3) ensure the compiler picks efficient `mulhi`-style codegen by structuring the multiply cleanly, (4) use `select` instead of branches in add/sub for better SIMD throughput.

@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.08524265746282575,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/00_seed.metal",
+    "elapsed_s": 0.5673458576202393,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.28809715771171646,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/01_candidate.metal",
+    "elapsed_s": 233.32080149650574,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.03708096677861069,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/02_candidate.metal",
+    "elapsed_s": 334.4290783405304,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.198292471298144,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/03_candidate.metal",
+    "elapsed_s": 233.13282299041748,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.29281315101745703,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/04_candidate.metal",
+    "elapsed_s": 256.19362568855286,
+    "is_new_best": true
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.21573500629857395,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/05_candidate.metal",
+    "elapsed_s": 280.54447197914124,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2580485037872807,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/06_candidate.metal",
+    "elapsed_s": 255.03150701522827,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.018813535450899407,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/07_candidate.metal",
+    "elapsed_s": 269.4307940006256,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.14638098988926124,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/08_candidate.metal",
+    "elapsed_s": 300.32319808006287,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2042697804464108,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/09_candidate.metal",
+    "elapsed_s": 274.12306118011475,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.028224316613211866,
+    "fail_reason": null,
+    "source_path": "results/binius_clmul_gemini-3.1-pro-preview_20260518_121813/10_candidate.metal",
+    "elapsed_s": 289.6736888885498,
+    "is_new_best": false
+  }
+]

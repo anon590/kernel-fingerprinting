@@ -1,0 +1,136 @@
+
+=== Metal kernel evolution: task=keccak_f1600_batch ===
+  model: gemini-3.1-pro-preview
+  chip:  Apple M1 Pro (peak 4500 GFLOPS fp32, 53 Gops/s int64 mul [est], 200 GB/s DRAM)
+  timing: n_warmup=3, n_measure=10, n_reps=3
+  output: results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900
+
+[seed] Evaluating seed kernel...
+  seed score: 0.0754  (17.5s)
+
+--- iteration 1/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 213.8s; evaluating...
+  score = 0.1238 (seed = 0.0754, best = 0.0754)
+       sha3_256_B16K:    1.07 ms,    57.2 Gbitops/s (u64) (9.9%)  [reps 1.06-1.07 ms]
+      sha3_256_B256K:   12.20 ms,    79.9 Gbitops/s (u64) (13.8%)  [reps 12.19-12.31 ms]
+        sha3_256_B4M:  195.02 ms,    80.0 Gbitops/s (u64) (13.9%)  [reps 195.01-195.24 ms]
+  NEW INCUMBENT
+
+--- iteration 2/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 259.9s; evaluating...
+  score = 0.1669 (seed = 0.0754, best = 0.1238)
+       sha3_256_B16K:    0.84 ms,    72.3 Gbitops/s (u64) (12.5%)  [reps 0.80-0.98 ms]
+      sha3_256_B256K:    8.81 ms,   110.7 Gbitops/s (u64) (19.2%)  [reps 8.72-9.19 ms]
+        sha3_256_B4M:  139.66 ms,   111.7 Gbitops/s (u64) (19.3%)  [reps 137.77-141.57 ms]
+  NEW INCUMBENT
+
+--- iteration 3/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 214.3s; evaluating...
+  incorrect: correctness failed at size sha3_256_B16K: bit_exact=65536
+
+--- iteration 4/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 303.5s; evaluating...
+  score = 0.1980 (seed = 0.0754, best = 0.1669)
+       sha3_256_B16K:    0.85 ms,    72.0 Gbitops/s (u64) (12.5%)  [reps 0.81-1.06 ms]
+      sha3_256_B256K:    6.69 ms,   145.8 Gbitops/s (u64) (25.3%)  [reps 6.68-6.71 ms]
+        sha3_256_B4M:  109.68 ms,   142.3 Gbitops/s (u64) (24.6%)  [reps 109.54-109.76 ms]
+  NEW INCUMBENT
+
+--- iteration 5/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 248.1s; evaluating...
+  score = 0.5393 (seed = 0.0754, best = 0.1980)
+       sha3_256_B16K:    0.49 ms,   124.5 Gbitops/s (u64) (21.6%)  [reps 0.49-0.49 ms]
+      sha3_256_B256K:    2.22 ms,   439.3 Gbitops/s (u64) (76.1%)  [reps 1.90-2.88 ms]
+        sha3_256_B4M:   28.25 ms,   552.4 Gbitops/s (u64) (95.7%)  [reps 27.69-28.54 ms]
+  NEW INCUMBENT
+
+--- iteration 6/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 264.1s; evaluating...
+  score = 0.7127 (seed = 0.0754, best = 0.5393)
+       sha3_256_B16K:    0.40 ms,   152.5 Gbitops/s (u64) (26.4%)  [reps 0.16-0.41 ms]
+      sha3_256_B256K:    1.47 ms,   665.5 Gbitops/s (u64) (115.3%)  [reps 1.46-1.47 ms]
+        sha3_256_B4M:   22.71 ms,   686.9 Gbitops/s (u64) (119.0%)  [reps 22.71-22.80 ms]
+  NEW INCUMBENT
+
+--- iteration 7/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 226.3s; evaluating...
+  score = 0.7423 (seed = 0.0754, best = 0.7127)
+       sha3_256_B16K:    0.37 ms,   164.9 Gbitops/s (u64) (28.6%)  [reps 0.11-0.37 ms]
+      sha3_256_B256K:    1.44 ms,   678.7 Gbitops/s (u64) (117.5%)  [reps 1.43-1.44 ms]
+        sha3_256_B4M:   22.17 ms,   703.6 Gbitops/s (u64) (121.9%)  [reps 22.16-22.32 ms]
+  NEW INCUMBENT
+
+--- iteration 8/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 272.5s; evaluating...
+  score = 0.6300 (seed = 0.0754, best = 0.7423)
+       sha3_256_B16K:    0.37 ms,   163.0 Gbitops/s (u64) (28.2%)  [reps 0.37-0.38 ms]
+      sha3_256_B256K:    2.32 ms,   420.4 Gbitops/s (u64) (72.8%)  [reps 1.98-2.38 ms]
+        sha3_256_B4M:   22.22 ms,   702.3 Gbitops/s (u64) (121.6%)  [reps 22.21-22.41 ms]
+
+--- iteration 9/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 242.4s; evaluating...
+  score = 0.7410 (seed = 0.0754, best = 0.7423)
+       sha3_256_B16K:    0.38 ms,   161.2 Gbitops/s (u64) (27.9%)  [reps 0.37-0.38 ms]
+      sha3_256_B256K:    1.42 ms,   686.3 Gbitops/s (u64) (118.9%)  [reps 1.42-1.42 ms]
+        sha3_256_B4M:   22.03 ms,   708.2 Gbitops/s (u64) (122.6%)  [reps 22.03-22.04 ms]
+
+--- iteration 10/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 255.3s; evaluating...
+  score = 0.7443 (seed = 0.0754, best = 0.7423)
+       sha3_256_B16K:    0.37 ms,   165.1 Gbitops/s (u64) (28.6%)  [reps 0.11-0.37 ms]
+      sha3_256_B256K:    1.43 ms,   681.0 Gbitops/s (u64) (117.9%)  [reps 1.43-1.44 ms]
+        sha3_256_B4M:   22.10 ms,   705.9 Gbitops/s (u64) (122.3%)  [reps 22.09-22.12 ms]
+  NEW INCUMBENT
+
+--- iteration 11/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 311.9s; evaluating...
+  score = 0.7844 (seed = 0.0754, best = 0.7443)
+       sha3_256_B16K:    0.35 ms,   174.2 Gbitops/s (u64) (30.2%)  [reps 0.23-0.35 ms]
+      sha3_256_B256K:    1.35 ms,   720.7 Gbitops/s (u64) (124.8%)  [reps 1.35-1.73 ms]
+        sha3_256_B4M:   21.08 ms,   740.2 Gbitops/s (u64) (128.2%)  [reps 21.08-21.10 ms]
+  NEW INCUMBENT
+
+--- iteration 12/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 249.4s; evaluating...
+  score = 0.6258 (seed = 0.0754, best = 0.7844)
+       sha3_256_B16K:    0.35 ms,   174.3 Gbitops/s (u64) (30.2%)  [reps 0.35-0.35 ms]
+      sha3_256_B256K:    2.67 ms,   364.6 Gbitops/s (u64) (63.2%)  [reps 1.67-2.81 ms]
+        sha3_256_B4M:   21.02 ms,   742.4 Gbitops/s (u64) (128.6%)  [reps 21.01-21.02 ms]
+
+--- iteration 13/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 285.5s; evaluating...
+  score = 0.6823 (seed = 0.0754, best = 0.7844)
+       sha3_256_B16K:    0.35 ms,   173.3 Gbitops/s (u64) (30.0%)  [reps 0.35-0.35 ms]
+      sha3_256_B256K:    2.06 ms,   474.4 Gbitops/s (u64) (82.2%)  [reps 1.93-2.23 ms]
+        sha3_256_B4M:   20.98 ms,   743.8 Gbitops/s (u64) (128.8%)  [reps 20.98-20.98 ms]
+
+--- iteration 14/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 230.5s; evaluating...
+  score = 0.7357 (seed = 0.0754, best = 0.7844)
+       sha3_256_B16K:    0.35 ms,   174.8 Gbitops/s (u64) (30.3%)  [reps 0.29-0.35 ms]
+      sha3_256_B256K:    1.65 ms,   591.9 Gbitops/s (u64) (102.5%)  [reps 1.35-2.04 ms]
+        sha3_256_B4M:   21.06 ms,   740.7 Gbitops/s (u64) (128.3%)  [reps 21.06-21.07 ms]
+
+--- iteration 15/15 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 277.1s; evaluating...
+  score = 0.7819 (seed = 0.0754, best = 0.7844)
+       sha3_256_B16K:    0.34 ms,   178.5 Gbitops/s (u64) (30.9%)  [reps 0.34-0.34 ms]
+      sha3_256_B256K:    1.38 ms,   708.1 Gbitops/s (u64) (122.6%)  [reps 1.37-1.39 ms]
+        sha3_256_B4M:   21.43 ms,   728.1 Gbitops/s (u64) (126.1%)  [reps 21.43-21.49 ms]
+
+=== done. seed=0.0754, best=0.7844, output=results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900 ===

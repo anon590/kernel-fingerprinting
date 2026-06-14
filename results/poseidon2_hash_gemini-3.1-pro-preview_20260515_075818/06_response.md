@@ -1,0 +1,271 @@
+To push the kernel performance significantly beyond the incumbent while preserving bit-exact correctness, we can apply several algorithmic and low-level arithmetic optimizations:
+
+1. **Fused Multiply-Add (`gold_mac`)**: Replaced sequential `gold_mul` and `gold_add` calls in the matrix-vector multiplications with a fused `gold_mac`. This avoids intermediate field reductions by directly accumulating the 64-bit addition into the 128-bit product before computing a single, combined reduction.
+2. **Dedicated Squaring (`gold_sqr`)**: S-boxes execute $x \mapsto x^7$ using $x^2, x^4, \dots$ which are mostly squares. We introduce a `gold_sqr` that eliminates one redundant 32x32 integer multiply compared to the general `gold_mul`. This saves 2 integer multiplications per S-box.
+3. **In-place Partial Matvec**: During the 22 partial rounds, the internal matrix update is $y_i = d_i \cdot x_i + s$. Because $s$ is fully computed upfront, we can write $y_i$ directly back to `state[i]` without needing a `tmp` array, saving $T$ register moves per round.
+4. **Compile-time Loop Unrolling**: We branch on `t` natively so that `ext_mds` and `int_diag` seamlessly drop into thread registers, avoiding constant-cache lookups in the inner-most loops.
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+constant ulong P_GOLD = 0xFFFFFFFF00000001ul;
+
+inline ulong gold_add(ulong a, ulong b) {
+    ulong t = a + b;
+    t += (t < a) ? 0xFFFFFFFFul : 0ul;
+    return (t >= P_GOLD) ? (t - P_GOLD) : t;
+}
+
+// Fused multiplication and addition: computes (a * b + c) mod P_GOLD
+inline ulong gold_mac(ulong a, ulong b, ulong c) {
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+
+    ulong a0b0 = (ulong)a0 * b0;
+    ulong a0b1 = (ulong)a0 * b1;
+    ulong a1b0 = (ulong)a1 * b0;
+    ulong a1b1 = (ulong)a1 * b1;
+
+    ulong mid = a1b0 + (uint)(a0b0 >> 32);
+    ulong hi = a1b1 + (uint)(mid >> 32);
+    mid = (uint)mid + a0b1;
+    hi += (uint)(mid >> 32);
+    ulong lo = (mid << 32) | (uint)a0b0;
+
+    // Accumulate `c` prior to reduction
+    lo += c;
+    hi += (lo < c) ? 1ul : 0ul;
+
+    uint hi_hi = (uint)(hi >> 32);
+    uint hi_lo = (uint)hi;
+
+    ulong t0 = lo - hi_hi;
+    t0 -= (t0 > lo) ? 0xFFFFFFFFul : 0ul;
+
+    ulong t1 = ((ulong)hi_lo << 32) - hi_lo;
+
+    ulong t2 = t0 + t1;
+    t2 += (t2 < t0) ? 0xFFFFFFFFul : 0ul;
+
+    return (t2 >= P_GOLD) ? (t2 - P_GOLD) : t2;
+}
+
+inline ulong gold_mul(ulong a, ulong b) {
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)b;
+    uint b1 = (uint)(b >> 32);
+
+    ulong a0b0 = (ulong)a0 * b0;
+    ulong a0b1 = (ulong)a0 * b1;
+    ulong a1b0 = (ulong)a1 * b0;
+    ulong a1b1 = (ulong)a1 * b1;
+
+    ulong mid = a1b0 + (uint)(a0b0 >> 32);
+    ulong hi = a1b1 + (uint)(mid >> 32);
+    mid = (uint)mid + a0b1;
+    hi += (uint)(mid >> 32);
+    ulong lo = (mid << 32) | (uint)a0b0;
+
+    uint hi_hi = (uint)(hi >> 32);
+    uint hi_lo = (uint)hi;
+
+    ulong t0 = lo - hi_hi;
+    t0 -= (t0 > lo) ? 0xFFFFFFFFul : 0ul;
+
+    ulong t1 = ((ulong)hi_lo << 32) - hi_lo;
+
+    ulong t2 = t0 + t1;
+    t2 += (t2 < t0) ? 0xFFFFFFFFul : 0ul;
+
+    return (t2 >= P_GOLD) ? (t2 - P_GOLD) : t2;
+}
+
+// Optimized squaring: saves one 32x32 integer multiplication over generic gold_mul
+inline ulong gold_sqr(ulong a) {
+    uint a0 = (uint)a;
+    uint a1 = (uint)(a >> 32);
+
+    ulong a0a0 = (ulong)a0 * a0;
+    ulong a0a1 = (ulong)a0 * a1;
+    ulong a1a1 = (ulong)a1 * a1;
+
+    ulong mid = a0a1 + (uint)(a0a0 >> 32);
+    ulong hi = a1a1 + (uint)(mid >> 32);
+    mid = (uint)mid + a0a1;
+    hi += (uint)(mid >> 32);
+    ulong lo = (mid << 32) | (uint)a0a0;
+
+    uint hi_hi = (uint)(hi >> 32);
+    uint hi_lo = (uint)hi;
+
+    ulong t0 = lo - hi_hi;
+    t0 -= (t0 > lo) ? 0xFFFFFFFFul : 0ul;
+
+    ulong t1 = ((ulong)hi_lo << 32) - hi_lo;
+
+    ulong t2 = t0 + t1;
+    t2 += (t2 < t0) ? 0xFFFFFFFFul : 0ul;
+
+    return (t2 >= P_GOLD) ? (t2 - P_GOLD) : t2;
+}
+
+inline ulong sbox(ulong x) {
+    ulong x2 = gold_sqr(x);
+    ulong x4 = gold_sqr(x2);
+    ulong x6 = gold_mul(x4, x2);
+    return gold_mul(x6, x);
+}
+
+template <uint T>
+inline void process_sponge(
+    device const ulong *in_state,
+    device       ulong *out_state,
+    device const ulong *rc_ext,
+    device const ulong *rc_int,
+    device const ulong *ext_mds,
+    device const ulong *int_diag,
+    uint rf,
+    uint rp,
+    uint idx)
+{
+    size_t base_idx = (size_t)idx * T;
+    
+    ulong state[T];
+    #pragma unroll
+    for (uint i = 0; i < T; ++i) {
+        state[i] = in_state[base_idx + i];
+    }
+
+    ulong mds[T][T];
+    #pragma unroll
+    for (uint i = 0; i < T; ++i) {
+        #pragma unroll
+        for (uint j = 0; j < T; ++j) {
+            mds[i][j] = ext_mds[i * T + j];
+        }
+    }
+
+    ulong diag[T];
+    #pragma unroll
+    for (uint i = 0; i < T; ++i) {
+        diag[i] = int_diag[i];
+    }
+
+    ulong tmp[T];
+
+    // Pre-multiply by external MDS.
+    #pragma unroll
+    for (uint i = 0; i < T; ++i) {
+        ulong acc = 0ul;
+        #pragma unroll
+        for (uint j = 0; j < T; ++j) {
+            acc = gold_mac(mds[i][j], state[j], acc);
+        }
+        tmp[i] = acc;
+    }
+    #pragma unroll
+    for (uint i = 0; i < T; ++i) state[i] = tmp[i];
+
+    uint half_f = rf >> 1;
+    device const ulong *rc_ext_ptr = rc_ext;
+
+    // First half full rounds.
+    for (uint r = 0; r < half_f; ++r) {
+        #pragma unroll
+        for (uint i = 0; i < T; ++i) {
+            state[i] = sbox(gold_add(state[i], rc_ext_ptr[i]));
+        }
+        rc_ext_ptr += T;
+        
+        #pragma unroll
+        for (uint i = 0; i < T; ++i) {
+            ulong acc = 0ul;
+            #pragma unroll
+            for (uint j = 0; j < T; ++j) {
+                acc = gold_mac(mds[i][j], state[j], acc);
+            }
+            tmp[i] = acc;
+        }
+        #pragma unroll
+        for (uint i = 0; i < T; ++i) state[i] = tmp[i];
+    }
+
+    device const ulong *rc_int_ptr = rc_int;
+    
+    // Partial rounds.
+    // Optimized: In-place direct update mapping completely to registers because
+    // only the sum (s) is needed cross-element during this diag block evaluation.
+    for (uint r = 0; r < rp; ++r) {
+        state[0] = sbox(gold_add(state[0], *rc_int_ptr));
+        rc_int_ptr++;
+        
+        ulong s = state[0];
+        #pragma unroll
+        for (uint i = 1; i < T; ++i) {
+            s = gold_add(s, state[i]);
+        }
+
+        #pragma unroll
+        for (uint i = 0; i < T; ++i) {
+            state[i] = gold_mac(diag[i], state[i], s);
+        }
+    }
+
+    // Second half full rounds.
+    for (uint r = half_f; r < rf; ++r) {
+        #pragma unroll
+        for (uint i = 0; i < T; ++i) {
+            state[i] = sbox(gold_add(state[i], rc_ext_ptr[i]));
+        }
+        rc_ext_ptr += T;
+        
+        #pragma unroll
+        for (uint i = 0; i < T; ++i) {
+            ulong acc = 0ul;
+            #pragma unroll
+            for (uint j = 0; j < T; ++j) {
+                acc = gold_mac(mds[i][j], state[j], acc);
+            }
+            tmp[i] = acc;
+        }
+        #pragma unroll
+        for (uint i = 0; i < T; ++i) state[i] = tmp[i];
+    }
+
+    #pragma unroll
+    for (uint i = 0; i < T; ++i) {
+        out_state[base_idx + i] = state[i];
+    }
+}
+
+kernel void poseidon2_hash(
+    device const ulong *in_state    [[buffer(0)]],
+    device       ulong *out_state   [[buffer(1)]],
+    device const ulong *rc_ext      [[buffer(2)]],
+    device const ulong *rc_int      [[buffer(3)]],
+    device const ulong *ext_mds     [[buffer(4)]],
+    device const ulong *int_diag    [[buffer(5)]],
+    constant uint      &t           [[buffer(6)]],
+    constant uint      &r_f         [[buffer(7)]],
+    constant uint      &r_p         [[buffer(8)]],
+    constant uint      &batch       [[buffer(9)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= batch) return;
+
+    // Switch forces compile-time unrolling of arity iterations
+    uint rf = r_f;
+    uint rp = r_p;
+    
+    switch (t) {
+        case 1: process_sponge<1>(in_state, out_state, rc_ext, rc_int, ext_mds, int_diag, rf, rp, idx); break;
+        case 2: process_sponge<2>(in_state, out_state, rc_ext, rc_int, ext_mds, int_diag, rf, rp, idx); break;
+        case 3: process_sponge<3>(in_state, out_state, rc_ext, rc_int, ext_mds, int_diag, rf, rp, idx); break;
+        case 4: process_sponge<4>(in_state, out_state, rc_ext, rc_int, ext_mds, int_diag, rf, rp, idx); break;
+    }
+}
+```

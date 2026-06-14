@@ -1,0 +1,3 @@
+**Planning function enhancements**
+
+I’m thinking about how to structure the process after checking conditions. If `r_f` equals 8 and `r_p` equals 32, we should definitely branch out after `mds jplusi`. Then, I’ll call the unrolled function and see if there’s a need for a fallback. Overall, this sounds like a solid plan that should improve efficiency. Now, I just need to implement the code for these changes!

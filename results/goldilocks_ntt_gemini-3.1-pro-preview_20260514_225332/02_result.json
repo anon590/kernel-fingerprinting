@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size N2_14: bit_exact=16375",
+  "sizes": [
+    {
+      "label": "N2_14",
+      "correct": false,
+      "error_value": 16375,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00013524999667424709,
+      "achieved": 33.918817839597835,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.16959408919798918
+    }
+  ]
+}

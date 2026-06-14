@@ -1,0 +1,94 @@
+
+=== Metal kernel evolution: task=merkle_build ===
+  model: gpt-5.5
+  chip:  Apple M1 Pro (peak 4500 GFLOPS fp32, 53 Gops/s int64 mul [est], 200 GB/s DRAM)
+  timing: n_warmup=3, n_measure=10, n_reps=3
+  output: results/merkle_build_gpt-5.5_20260516_203852
+
+[seed] Evaluating seed kernel...
+  seed score: 0.3113  (1.2s)
+
+--- iteration 1/10 ---
+  [llm] OpenAI tokens: in=4104, out=21348
+  generated in 421.3s; evaluating...
+  score = 0.3520 (seed = 0.3113, best = 0.3113)
+             a2_N64K:    1.62 ms,    13.4 Gmodmul/s (int64) (25.0%)  [reps 1.62-1.64 ms]
+            a2_N256K:    4.21 ms,    20.6 Gmodmul/s (int64) (38.7%)  [reps 4.19-4.21 ms]
+              a2_N1M:   14.44 ms,    24.0 Gmodmul/s (int64) (45.0%)  [reps 14.43-14.45 ms]
+  NEW INCUMBENT
+
+--- iteration 2/10 ---
+  [llm] OpenAI tokens: in=5672, out=24531
+  generated in 465.2s; evaluating...
+  score = 0.4309 (seed = 0.3113, best = 0.3520)
+             a2_N64K:    1.37 ms,    15.8 Gmodmul/s (int64) (29.6%)  [reps 1.33-1.69 ms]
+            a2_N256K:    3.39 ms,    25.6 Gmodmul/s (int64) (47.9%)  [reps 3.39-3.40 ms]
+              a2_N1M:   11.54 ms,    30.1 Gmodmul/s (int64) (56.4%)  [reps 11.53-11.55 ms]
+  NEW INCUMBENT
+
+--- iteration 3/10 ---
+  [llm] OpenAI tokens: in=8683, out=24123
+  generated in 407.8s; evaluating...
+  score = 0.3680 (seed = 0.3113, best = 0.4309)
+             a2_N64K:    1.68 ms,    12.9 Gmodmul/s (int64) (24.2%)  [reps 1.67-1.69 ms]
+            a2_N256K:    3.98 ms,    21.8 Gmodmul/s (int64) (40.8%)  [reps 3.95-3.99 ms]
+              a2_N1M:   12.93 ms,    26.8 Gmodmul/s (int64) (50.3%)  [reps 12.92-12.93 ms]
+
+--- iteration 4/10 ---
+  [llm] OpenAI tokens: in=20171, out=19590
+  generated in 321.9s; evaluating...
+  score = 0.4272 (seed = 0.3113, best = 0.4309)
+             a2_N64K:    1.37 ms,    15.8 Gmodmul/s (int64) (29.6%)  [reps 1.36-1.37 ms]
+            a2_N256K:    3.46 ms,    25.1 Gmodmul/s (int64) (47.0%)  [reps 3.45-3.48 ms]
+              a2_N1M:   11.60 ms,    29.9 Gmodmul/s (int64) (56.1%)  [reps 11.60-11.61 ms]
+
+--- iteration 5/10 ---
+  [llm] OpenAI tokens: in=17371, out=16124
+  generated in 242.7s; evaluating...
+  score = 0.3729 (seed = 0.3113, best = 0.4309)
+             a2_N64K:    1.74 ms,    12.5 Gmodmul/s (int64) (23.4%)  [reps 1.72-1.92 ms]
+            a2_N256K:    3.88 ms,    22.4 Gmodmul/s (int64) (41.9%)  [reps 3.87-3.89 ms]
+              a2_N1M:   12.32 ms,    28.2 Gmodmul/s (int64) (52.8%)  [reps 12.31-12.36 ms]
+
+--- iteration 6/10 ---
+  [llm] OpenAI tokens: in=16810, out=22180
+  generated in 389.4s; evaluating...
+  score = 0.3996 (seed = 0.3113, best = 0.4309)
+             a2_N64K:    1.68 ms,    12.9 Gmodmul/s (int64) (24.3%)  [reps 1.50-1.72 ms]
+            a2_N256K:    3.44 ms,    25.2 Gmodmul/s (int64) (47.3%)  [reps 3.44-3.45 ms]
+              a2_N1M:   11.71 ms,    29.6 Gmodmul/s (int64) (55.6%)  [reps 11.71-11.71 ms]
+
+--- iteration 7/10 ---
+  [llm] OpenAI tokens: in=16746, out=19734
+  generated in 324.4s; evaluating...
+  score = 0.3770 (seed = 0.3113, best = 0.4309)
+             a2_N64K:    1.62 ms,    13.4 Gmodmul/s (int64) (25.1%)  [reps 1.61-1.63 ms]
+            a2_N256K:    3.89 ms,    22.3 Gmodmul/s (int64) (41.8%)  [reps 3.89-3.90 ms]
+              a2_N1M:   12.76 ms,    27.2 Gmodmul/s (int64) (51.0%)  [reps 12.74-12.77 ms]
+
+--- iteration 8/10 ---
+  [llm] OpenAI tokens: in=18274, out=18235
+  generated in 287.7s; evaluating...
+  score = 0.3607 (seed = 0.3113, best = 0.4309)
+             a2_N64K:    1.84 ms,    11.8 Gmodmul/s (int64) (22.1%)  [reps 1.64-1.93 ms]
+            a2_N256K:    3.88 ms,    22.4 Gmodmul/s (int64) (42.0%)  [reps 3.88-3.88 ms]
+              a2_N1M:   12.83 ms,    27.1 Gmodmul/s (int64) (50.7%)  [reps 12.83-12.84 ms]
+
+--- iteration 9/10 ---
+  [llm] OpenAI tokens: in=18297, out=16891
+  generated in 262.0s; evaluating...
+  score = 0.4397 (seed = 0.3113, best = 0.4309)
+             a2_N64K:    1.30 ms,    16.7 Gmodmul/s (int64) (31.2%)  [reps 1.30-1.32 ms]
+            a2_N256K:    3.38 ms,    25.7 Gmodmul/s (int64) (48.1%)  [reps 3.38-3.38 ms]
+              a2_N1M:   11.50 ms,    30.2 Gmodmul/s (int64) (56.6%)  [reps 11.50-11.50 ms]
+  NEW INCUMBENT
+
+--- iteration 10/10 ---
+  [llm] OpenAI tokens: in=10372, out=22929
+  generated in 379.3s; evaluating...
+  score = 0.4149 (seed = 0.3113, best = 0.4397)
+             a2_N64K:    1.62 ms,    13.4 Gmodmul/s (int64) (25.0%)  [reps 1.30-1.63 ms]
+            a2_N256K:    3.30 ms,    26.3 Gmodmul/s (int64) (49.3%)  [reps 3.28-3.30 ms]
+              a2_N1M:   11.25 ms,    30.8 Gmodmul/s (int64) (57.8%)  [reps 11.25-11.25 ms]
+
+=== done. seed=0.3113, best=0.4397, output=results/merkle_build_gpt-5.5_20260516_203852 ===

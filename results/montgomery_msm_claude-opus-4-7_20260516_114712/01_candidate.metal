@@ -1,0 +1,413 @@
+#include <metal_stdlib>
+using namespace metal;
+
+constexpr constant uint N_LIMBS = 6u;
+constexpr constant uint POINT_LIMBS = 18u;
+constexpr constant uint SCALAR_BITS = 256u;
+constexpr constant uint WINDOW = 4u;
+constexpr constant uint TABLE_SIZE = 16u; // 2^WINDOW
+
+constant ulong LIMB_MASK_LO32 = 0x00000000FFFFFFFFul;
+
+inline ulong2 umul128(ulong a, ulong b) {
+    uint a0 = (uint)(a);
+    uint a1 = (uint)(a >> 32);
+    uint b0 = (uint)(b);
+    uint b1 = (uint)(b >> 32);
+
+    ulong p00 = (ulong)a0 * (ulong)b0;
+    ulong p01 = (ulong)a0 * (ulong)b1;
+    ulong p10 = (ulong)a1 * (ulong)b0;
+    ulong p11 = (ulong)a1 * (ulong)b1;
+
+    ulong mid = (p00 >> 32) + (p01 & LIMB_MASK_LO32) + (p10 & LIMB_MASK_LO32);
+    ulong lo  = (p00 & LIMB_MASK_LO32) | (mid << 32);
+    ulong hi  = p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+    return ulong2(lo, hi);
+}
+
+inline ulong2 fma_add128(ulong a, ulong b, ulong t, ulong c) {
+    ulong2 prod = umul128(a, b);
+    ulong lo1 = prod.x + t;
+    ulong cy1 = (lo1 < prod.x) ? 1ul : 0ul;
+    ulong hi1 = prod.y + cy1;
+    ulong lo2 = lo1 + c;
+    ulong cy2 = (lo2 < lo1) ? 1ul : 0ul;
+    ulong hi2 = hi1 + cy2;
+    return ulong2(lo2, hi2);
+}
+
+inline void copy_n(thread ulong *dst, thread const ulong *src) {
+    for (uint i = 0u; i < N_LIMBS; ++i) dst[i] = src[i];
+}
+
+inline bool is_zero_n(thread const ulong *a) {
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        if (a[i] != 0ul) return false;
+    }
+    return true;
+}
+
+inline bool eq_n(thread const ulong *a, thread const ulong *b) {
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+inline void mod_add(thread ulong *c,
+                    thread const ulong *a, thread const ulong *b,
+                    device const ulong *q)
+{
+    ulong sum[N_LIMBS];
+    ulong carry = 0ul;
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        ulong s = a[i] + carry;
+        ulong cy1 = (s < a[i]) ? 1ul : 0ul;
+        ulong t = s + b[i];
+        ulong cy2 = (t < s) ? 1ul : 0ul;
+        sum[i] = t;
+        carry = cy1 + cy2;
+    }
+    ulong diff[N_LIMBS];
+    ulong borrow = 0ul;
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        ulong tv = sum[i] - q[i];
+        ulong b1 = (tv > sum[i]) ? 1ul : 0ul;
+        ulong d = tv - borrow;
+        ulong b2 = (d > tv) ? 1ul : 0ul;
+        diff[i] = d;
+        borrow = b1 + b2;
+    }
+    bool use_diff = (carry != 0ul) || (borrow == 0ul);
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        c[i] = use_diff ? diff[i] : sum[i];
+    }
+}
+
+inline void mod_sub(thread ulong *c,
+                    thread const ulong *a, thread const ulong *b,
+                    device const ulong *q)
+{
+    ulong diff[N_LIMBS];
+    ulong borrow = 0ul;
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        ulong tv = a[i] - b[i];
+        ulong b1 = (tv > a[i]) ? 1ul : 0ul;
+        ulong d = tv - borrow;
+        ulong b2 = (d > tv) ? 1ul : 0ul;
+        diff[i] = d;
+        borrow = b1 + b2;
+    }
+    if (borrow != 0ul) {
+        ulong carry = 0ul;
+        for (uint i = 0u; i < N_LIMBS; ++i) {
+            ulong s = diff[i] + carry;
+            ulong cy1 = (s < diff[i]) ? 1ul : 0ul;
+            ulong t = s + q[i];
+            ulong cy2 = (t < s) ? 1ul : 0ul;
+            c[i] = t;
+            carry = cy1 + cy2;
+        }
+    } else {
+        for (uint i = 0u; i < N_LIMBS; ++i) c[i] = diff[i];
+    }
+}
+
+inline void mont_mul(thread ulong *out,
+                     thread const ulong *a, thread const ulong *b,
+                     device const ulong *q, ulong q_inv_neg)
+{
+    ulong t[N_LIMBS + 2];
+    for (uint i = 0u; i < N_LIMBS + 2u; ++i) t[i] = 0ul;
+
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        ulong C = 0ul;
+        for (uint j = 0u; j < N_LIMBS; ++j) {
+            ulong2 r = fma_add128(a[j], b[i], t[j], C);
+            t[j] = r.x;
+            C = r.y;
+        }
+        {
+            ulong s = t[N_LIMBS] + C;
+            ulong cy = (s < t[N_LIMBS]) ? 1ul : 0ul;
+            t[N_LIMBS] = s;
+            t[N_LIMBS + 1] += cy;
+        }
+
+        ulong m = t[0] * q_inv_neg;
+
+        C = 0ul;
+        for (uint j = 0u; j < N_LIMBS; ++j) {
+            ulong2 r = fma_add128(m, q[j], t[j], C);
+            t[j] = r.x;
+            C = r.y;
+        }
+        {
+            ulong s = t[N_LIMBS] + C;
+            ulong cy = (s < t[N_LIMBS]) ? 1ul : 0ul;
+            t[N_LIMBS] = s;
+            t[N_LIMBS + 1] += cy;
+        }
+
+        for (uint j = 0u; j < N_LIMBS + 1u; ++j) {
+            t[j] = t[j + 1];
+        }
+        t[N_LIMBS + 1] = 0ul;
+    }
+
+    ulong diff[N_LIMBS];
+    ulong borrow = 0ul;
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        ulong tv = t[i] - q[i];
+        ulong b1 = (tv > t[i]) ? 1ul : 0ul;
+        ulong d = tv - borrow;
+        ulong b2 = (d > tv) ? 1ul : 0ul;
+        diff[i] = d;
+        borrow = b1 + b2;
+    }
+    bool use_diff = (t[N_LIMBS] != 0ul) || (borrow == 0ul);
+    for (uint i = 0u; i < N_LIMBS; ++i) {
+        out[i] = use_diff ? diff[i] : t[i];
+    }
+}
+
+inline void load_point(thread ulong *X, thread ulong *Y, thread ulong *Z,
+                       device const ulong *src)
+{
+    for (uint i = 0u; i < N_LIMBS; ++i) X[i] = src[i];
+    for (uint i = 0u; i < N_LIMBS; ++i) Y[i] = src[N_LIMBS + i];
+    for (uint i = 0u; i < N_LIMBS; ++i) Z[i] = src[2u * N_LIMBS + i];
+}
+
+inline void store_point(device ulong *dst,
+                        thread const ulong *X, thread const ulong *Y, thread const ulong *Z)
+{
+    for (uint i = 0u; i < N_LIMBS; ++i) dst[i] = X[i];
+    for (uint i = 0u; i < N_LIMBS; ++i) dst[N_LIMBS + i] = Y[i];
+    for (uint i = 0u; i < N_LIMBS; ++i) dst[2u * N_LIMBS + i] = Z[i];
+}
+
+inline void zero_point(thread ulong *X, thread ulong *Y, thread ulong *Z) {
+    for (uint i = 0u; i < N_LIMBS; ++i) X[i] = 0ul;
+    for (uint i = 0u; i < N_LIMBS; ++i) Y[i] = 0ul;
+    for (uint i = 0u; i < N_LIMBS; ++i) Z[i] = 0ul;
+}
+
+inline void jac_double_pt(thread ulong *oX, thread ulong *oY, thread ulong *oZ,
+                          thread const ulong *X, thread const ulong *Y, thread const ulong *Z,
+                          device const ulong *q, ulong q_inv_neg)
+{
+    if (is_zero_n(Z) || is_zero_n(Y)) {
+        zero_point(oX, oY, oZ);
+        return;
+    }
+    ulong A[N_LIMBS], B[N_LIMBS], C[N_LIMBS];
+    ulong D[N_LIMBS], E[N_LIMBS], F[N_LIMBS];
+    ulong tmp[N_LIMBS], tmp2[N_LIMBS];
+
+    mont_mul(A, X, X, q, q_inv_neg);
+    mont_mul(B, Y, Y, q, q_inv_neg);
+    mont_mul(C, B, B, q, q_inv_neg);
+
+    mod_add(tmp, X, B, q);
+    mont_mul(D, tmp, tmp, q, q_inv_neg);
+    mod_sub(D, D, A, q);
+    mod_sub(D, D, C, q);
+    mod_add(D, D, D, q);
+
+    mod_add(E, A, A, q);
+    mod_add(E, E, A, q);
+
+    mont_mul(F, E, E, q, q_inv_neg);
+
+    mod_add(tmp, D, D, q);
+    mod_sub(oX, F, tmp, q);
+
+    mod_sub(tmp, D, oX, q);
+    mont_mul(tmp, E, tmp, q, q_inv_neg);
+    mod_add(tmp2, C, C, q);
+    mod_add(tmp2, tmp2, tmp2, q);
+    mod_add(tmp2, tmp2, tmp2, q);
+    mod_sub(oY, tmp, tmp2, q);
+
+    mont_mul(tmp, Y, Z, q, q_inv_neg);
+    mod_add(oZ, tmp, tmp, q);
+}
+
+inline void jac_add_pt(thread ulong *oX, thread ulong *oY, thread ulong *oZ,
+                       thread const ulong *X1, thread const ulong *Y1, thread const ulong *Z1,
+                       thread const ulong *X2, thread const ulong *Y2, thread const ulong *Z2,
+                       device const ulong *q, ulong q_inv_neg)
+{
+    if (is_zero_n(Z1)) {
+        copy_n(oX, X2); copy_n(oY, Y2); copy_n(oZ, Z2);
+        return;
+    }
+    if (is_zero_n(Z2)) {
+        copy_n(oX, X1); copy_n(oY, Y1); copy_n(oZ, Z1);
+        return;
+    }
+    ulong Z1Z1[N_LIMBS], Z2Z2[N_LIMBS];
+    ulong U1[N_LIMBS], U2[N_LIMBS], S1[N_LIMBS], S2[N_LIMBS];
+    ulong H[N_LIMBS], R[N_LIMBS];
+    ulong HH[N_LIMBS], HHH[N_LIMBS], V[N_LIMBS];
+    ulong tmp[N_LIMBS], tmp2[N_LIMBS];
+
+    mont_mul(Z1Z1, Z1, Z1, q, q_inv_neg);
+    mont_mul(Z2Z2, Z2, Z2, q, q_inv_neg);
+    mont_mul(U1,   X1, Z2Z2, q, q_inv_neg);
+    mont_mul(U2,   X2, Z1Z1, q, q_inv_neg);
+    mont_mul(tmp,  Y1, Z2,   q, q_inv_neg);
+    mont_mul(S1,   tmp, Z2Z2, q, q_inv_neg);
+    mont_mul(tmp,  Y2, Z1,   q, q_inv_neg);
+    mont_mul(S2,   tmp, Z1Z1, q, q_inv_neg);
+
+    if (eq_n(U1, U2)) {
+        if (eq_n(S1, S2)) {
+            jac_double_pt(oX, oY, oZ, X1, Y1, Z1, q, q_inv_neg);
+        } else {
+            zero_point(oX, oY, oZ);
+        }
+        return;
+    }
+
+    mod_sub(H,   U2, U1, q);
+    mod_sub(R,   S2, S1, q);
+    mont_mul(HH,  H, H, q, q_inv_neg);
+    mont_mul(HHH, H, HH, q, q_inv_neg);
+    mont_mul(V,   U1, HH, q, q_inv_neg);
+
+    mont_mul(oX, R, R, q, q_inv_neg);
+    mod_sub(oX, oX, HHH, q);
+    mod_add(tmp, V, V, q);
+    mod_sub(oX, oX, tmp, q);
+
+    mod_sub(tmp, V, oX, q);
+    mont_mul(tmp, R, tmp, q, q_inv_neg);
+    mont_mul(tmp2, S1, HHH, q, q_inv_neg);
+    mod_sub(oY, tmp, tmp2, q);
+
+    mont_mul(tmp, Z1, Z2, q, q_inv_neg);
+    mont_mul(oZ, tmp, H, q, q_inv_neg);
+}
+
+// ------------------------------------------------------------------
+// Windowed scalar multiplication with w=4. Builds a table of
+// {0*P, 1*P, 2*P, ..., 15*P} once, then scans the scalar 4 bits at a
+// time from MSB to LSB: at each step do 4 doublings + 1 add of the
+// table entry. Also skips leading zero windows by initialising the
+// accumulator from the first non-zero window directly.
+// ------------------------------------------------------------------
+kernel void montgomery_msm_pair(
+    device const ulong *scalars      [[buffer(0)]],
+    device const ulong *points_in    [[buffer(1)]],
+    device       ulong *scratch      [[buffer(2)]],
+    device const ulong *q            [[buffer(3)]],
+    constant ulong     &q_inv_neg    [[buffer(4)]],
+    constant uint      &n_pairs      [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= n_pairs) return;
+
+    ulong s[4];
+    s[0] = scalars[idx * 4u + 0u];
+    s[1] = scalars[idx * 4u + 1u];
+    s[2] = scalars[idx * 4u + 2u];
+    s[3] = scalars[idx * 4u + 3u];
+
+    // Load P.
+    ulong PX[N_LIMBS], PY[N_LIMBS], PZ[N_LIMBS];
+    load_point(PX, PY, PZ, points_in + idx * POINT_LIMBS);
+
+    // Precompute table[k] = k * P, k = 0..15. Stored as 3*6=18 ulongs each.
+    // 16 entries * 18 ulongs = 288 ulongs of thread storage. Tight but ok.
+    ulong tblX[TABLE_SIZE][N_LIMBS];
+    ulong tblY[TABLE_SIZE][N_LIMBS];
+    ulong tblZ[TABLE_SIZE][N_LIMBS];
+
+    // table[0] = O
+    for (uint i = 0u; i < N_LIMBS; ++i) { tblX[0][i] = 0ul; tblY[0][i] = 0ul; tblZ[0][i] = 0ul; }
+    // table[1] = P
+    for (uint i = 0u; i < N_LIMBS; ++i) { tblX[1][i] = PX[i]; tblY[1][i] = PY[i]; tblZ[1][i] = PZ[i]; }
+
+    // table[2] = 2P
+    {
+        ulong RX[N_LIMBS], RY[N_LIMBS], RZ[N_LIMBS];
+        jac_double_pt(RX, RY, RZ, PX, PY, PZ, q, q_inv_neg);
+        for (uint i = 0u; i < N_LIMBS; ++i) { tblX[2][i] = RX[i]; tblY[2][i] = RY[i]; tblZ[2][i] = RZ[i]; }
+    }
+    // table[k] = table[k-1] + P for k = 3..15
+    for (uint k = 3u; k < TABLE_SIZE; ++k) {
+        ulong AX[N_LIMBS], AY[N_LIMBS], AZ[N_LIMBS];
+        for (uint i = 0u; i < N_LIMBS; ++i) { AX[i] = tblX[k-1u][i]; AY[i] = tblY[k-1u][i]; AZ[i] = tblZ[k-1u][i]; }
+        ulong RX[N_LIMBS], RY[N_LIMBS], RZ[N_LIMBS];
+        jac_add_pt(RX, RY, RZ, AX, AY, AZ, PX, PY, PZ, q, q_inv_neg);
+        for (uint i = 0u; i < N_LIMBS; ++i) { tblX[k][i] = RX[i]; tblY[k][i] = RY[i]; tblZ[k][i] = RZ[i]; }
+    }
+
+    // Accumulator A.
+    ulong AX[N_LIMBS], AY[N_LIMBS], AZ[N_LIMBS];
+    zero_point(AX, AY, AZ);
+
+    bool started = false;
+    ulong TX[N_LIMBS], TY[N_LIMBS], TZ[N_LIMBS];
+
+    // SCALAR_BITS = 256, WINDOW = 4 -> 64 windows from MSB to LSB.
+    for (int w = 63; w >= 0; --w) {
+        uint bitpos = (uint)w * WINDOW;
+        uint word = bitpos >> 6u;
+        uint shift = bitpos & 63u;
+        uint nib = (uint)((s[word] >> shift) & 0xFul);
+
+        if (started) {
+            // 4 doublings.
+            for (uint d = 0u; d < WINDOW; ++d) {
+                jac_double_pt(TX, TY, TZ, AX, AY, AZ, q, q_inv_neg);
+                copy_n(AX, TX); copy_n(AY, TY); copy_n(AZ, TZ);
+            }
+            if (nib != 0u) {
+                // Variable-index lookup into table.
+                ulong BX[N_LIMBS], BY[N_LIMBS], BZ[N_LIMBS];
+                for (uint i = 0u; i < N_LIMBS; ++i) {
+                    BX[i] = tblX[nib][i];
+                    BY[i] = tblY[nib][i];
+                    BZ[i] = tblZ[nib][i];
+                }
+                jac_add_pt(TX, TY, TZ, AX, AY, AZ, BX, BY, BZ, q, q_inv_neg);
+                copy_n(AX, TX); copy_n(AY, TY); copy_n(AZ, TZ);
+            }
+        } else {
+            if (nib != 0u) {
+                // Initialize accumulator directly from table[nib].
+                for (uint i = 0u; i < N_LIMBS; ++i) {
+                    AX[i] = tblX[nib][i];
+                    AY[i] = tblY[nib][i];
+                    AZ[i] = tblZ[nib][i];
+                }
+                started = true;
+            }
+        }
+    }
+
+    store_point(scratch + idx * POINT_LIMBS, AX, AY, AZ);
+}
+
+kernel void montgomery_msm_reduce(
+    device       ulong *scratch      [[buffer(0)]],
+    device const ulong *q            [[buffer(1)]],
+    constant ulong     &q_inv_neg    [[buffer(2)]],
+    constant uint      &half_count   [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= half_count) return;
+
+    ulong AX[N_LIMBS], AY[N_LIMBS], AZ[N_LIMBS];
+    ulong BX[N_LIMBS], BY[N_LIMBS], BZ[N_LIMBS];
+    load_point(AX, AY, AZ, scratch + idx * POINT_LIMBS);
+    load_point(BX, BY, BZ, scratch + (idx + half_count) * POINT_LIMBS);
+
+    ulong RX[N_LIMBS], RY[N_LIMBS], RZ[N_LIMBS];
+    jac_add_pt(RX, RY, RZ, AX, AY, AZ, BX, BY, BZ, q, q_inv_neg);
+    store_point(scratch + idx * POINT_LIMBS, RX, RY, RZ);
+}

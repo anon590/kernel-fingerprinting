@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size w16_C64K: bit_exact=131072",
+  "sizes": [
+    {
+      "label": "w16_C64K",
+      "correct": false,
+      "error_value": 131072,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.005942354167927988,
+      "achieved": 656.4238027165786,
+      "achieved_unit": "Gbitops/s (u64)",
+      "ceiling": 1125.0,
+      "ceiling_unit": "Gops/s (u64 bitop, est)",
+      "fraction_of_ceiling": 0.5834878246369588
+    }
+  ]
+}

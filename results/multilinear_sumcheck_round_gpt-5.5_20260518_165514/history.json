@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.012594084791284247,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/00_seed.metal",
+    "elapsed_s": 0.2445361614227295,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.08690235591881525,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/01_candidate.metal",
+    "elapsed_s": 327.5891389846802,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.12720307086961388,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/02_candidate.metal",
+    "elapsed_s": 360.1286053657532,
+    "is_new_best": true
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.080718344118207,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/03_candidate.metal",
+    "elapsed_s": 366.4788558483124,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.08705146972369718,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/04_candidate.metal",
+    "elapsed_s": 318.4638977050781,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.10772457220545714,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/05_candidate.metal",
+    "elapsed_s": 330.39443588256836,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.08651800700320555,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/06_candidate.metal",
+    "elapsed_s": 256.5483069419861,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.09220900400741823,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/07_candidate.metal",
+    "elapsed_s": 422.9312336444855,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.11470596762961699,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/08_candidate.metal",
+    "elapsed_s": 328.9948592185974,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.09066537156509358,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/09_candidate.metal",
+    "elapsed_s": 277.0970051288605,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.0786852712968635,
+    "fail_reason": null,
+    "source_path": "results/multilinear_sumcheck_round_gpt-5.5_20260518_165514/10_candidate.metal",
+    "elapsed_s": 310.65248680114746,
+    "is_new_best": false
+  }
+]

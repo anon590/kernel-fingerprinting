@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size kyb_B1: bit_exact=37",
+  "sizes": [
+    {
+      "label": "kyb_B1",
+      "correct": false,
+      "error_value": 37,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 2.6624999918567482e-05,
+      "achieved": 0.03365258226255078,
+      "achieved_unit": "Gmodmul/s (u32)",
+      "ceiling": 53.34577548064785,
+      "ceiling_unit": "Gops/s (int64 mul, est)",
+      "fraction_of_ceiling": 0.000630838748885727
+    }
+  ]
+}

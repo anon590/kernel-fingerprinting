@@ -1,0 +1,132 @@
+{
+  "task": "montgomery_msm",
+  "model": "gemini-3.1-pro-preview",
+  "chip": "Apple M1 Pro",
+  "n_iterations": 10,
+  "seed_score": 0.0039467370058945865,
+  "best_score": 0.006970873190834613,
+  "improvement": 1.7662370663217173,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0039467370058945865,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/00_seed.metal",
+      "elapsed_s": 80.89432287216187,
+      "is_new_best": true
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.00275860845363212,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/01_candidate.metal",
+      "elapsed_s": 377.1502149105072,
+      "is_new_best": false
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0014136548427909807,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/02_candidate.metal",
+      "elapsed_s": 404.64843225479126,
+      "is_new_best": false
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0016365846365907274,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/03_candidate.metal",
+      "elapsed_s": 486.94342494010925,
+      "is_new_best": false
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0012773887045455026,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/04_candidate.metal",
+      "elapsed_s": 555.1118729114532,
+      "is_new_best": false
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.004432940422799783,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/05_candidate.metal",
+      "elapsed_s": 367.9628369808197,
+      "is_new_best": true
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.003944581671702605,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/06_candidate.metal",
+      "elapsed_s": 391.13045835494995,
+      "is_new_best": false
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.004272570496323186,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/07_candidate.metal",
+      "elapsed_s": 376.0872793197632,
+      "is_new_best": false
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.004246136684360132,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/08_candidate.metal",
+      "elapsed_s": 374.6312623023987,
+      "is_new_best": false
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.006970873190834613,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/09_candidate.metal",
+      "elapsed_s": 344.5302839279175,
+      "is_new_best": true
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.003198142800335493,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611/10_candidate.metal",
+      "elapsed_s": 414.083176612854,
+      "is_new_best": false
+    }
+  ]
+}

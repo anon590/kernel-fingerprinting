@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.003669715246498924,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/00_seed.metal",
+    "elapsed_s": 0.07157397270202637,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.010244118344773873,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/01_candidate.metal",
+    "elapsed_s": 1791.3882291316986,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.010786251824175287,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/02_candidate.metal",
+    "elapsed_s": 555.9700517654419,
+    "is_new_best": true
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": false,
+    "correct": false,
+    "score": null,
+    "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:4:16: error: program scope variable must reside in constant address space\nconstexpr uint N_MAX = 256u;\n               ^\n\" UserInfo={NSLocalizedDescription=program_source:4:16: error: program scope variable must reside in constant address space\nconstexpr uint N_MAX = 256u;\n               ^\n}",
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/03_candidate.metal",
+    "elapsed_s": 497.96223497390747,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.009906472983308016,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/04_candidate.metal",
+    "elapsed_s": 311.4748840332031,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.010598012872478885,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/05_candidate.metal",
+    "elapsed_s": 516.8625900745392,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.011389221639017271,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/06_candidate.metal",
+    "elapsed_s": 858.0785541534424,
+    "is_new_best": true
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.011500694336413791,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/07_candidate.metal",
+    "elapsed_s": 492.76654410362244,
+    "is_new_best": true
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.014389917856260285,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/08_candidate.metal",
+    "elapsed_s": 568.8228123188019,
+    "is_new_best": true
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.012526149818947193,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/09_candidate.metal",
+    "elapsed_s": 413.0019705295563,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.010283360584145943,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gpt-5.5_20260517_140621/10_candidate.metal",
+    "elapsed_s": 477.73065876960754,
+    "is_new_best": false
+  }
+]

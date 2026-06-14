@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size uniform_N4K: bit_exact=2",
+  "sizes": [
+    {
+      "label": "uniform_N4K",
+      "correct": false,
+      "error_value": 2,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 0.00473547916408279,
+      "achieved": 1.1486668638005861,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.005743334319002931
+    }
+  ]
+}

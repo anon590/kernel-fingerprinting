@@ -1,0 +1,93 @@
+
+=== Metal kernel evolution: task=poseidon2_hash ===
+  model: gpt-5.5
+  chip:  Apple M1 Pro (peak 4500 GFLOPS fp32, 53 Gops/s int64 mul [est], 200 GB/s DRAM)
+  timing: n_warmup=3, n_measure=10, n_reps=3
+  output: results/poseidon2_hash_gpt-5.5_20260516_213756
+
+[seed] Evaluating seed kernel...
+  seed score: 0.2456  (1.0s)
+
+--- iteration 1/10 ---
+  [llm] OpenAI tokens: in=3516, out=16504
+  generated in 314.6s; evaluating...
+  score = 0.2744 (seed = 0.2456, best = 0.2456)
+              t3_B4K:    0.24 ms,     5.6 Gmodmul/s (int64) (10.5%)  [reps 0.24-0.24 ms]
+             t3_B64K:    0.93 ms,    23.3 Gmodmul/s (int64) (43.8%)  [reps 0.93-1.21 ms]
+              t3_B1M:   14.41 ms,    24.1 Gmodmul/s (int64) (45.1%)  [reps 14.41-14.42 ms]
+  NEW INCUMBENT
+
+--- iteration 2/10 ---
+  [llm] OpenAI tokens: in=4223, out=23907
+  generated in 448.5s; evaluating...
+  score = 0.1996 (seed = 0.2456, best = 0.2744)
+              t3_B4K:    0.46 ms,     2.9 Gmodmul/s (int64) (5.5%)  [reps 0.46-0.46 ms]
+             t3_B64K:    1.32 ms,    16.4 Gmodmul/s (int64) (30.8%)  [reps 1.31-1.39 ms]
+              t3_B1M:   13.82 ms,    25.1 Gmodmul/s (int64) (47.1%)  [reps 13.80-13.83 ms]
+
+--- iteration 3/10 ---
+  [llm] OpenAI tokens: in=8013, out=20444
+  generated in 379.5s; evaluating...
+  score = 0.2597 (seed = 0.2456, best = 0.2744)
+              t3_B4K:    0.33 ms,     4.2 Gmodmul/s (int64) (7.8%)  [reps 0.33-0.33 ms]
+             t3_B64K:    0.88 ms,    24.5 Gmodmul/s (int64) (46.0%)  [reps 0.88-1.02 ms]
+              t3_B1M:   13.30 ms,    26.1 Gmodmul/s (int64) (48.9%)  [reps 13.30-13.30 ms]
+
+--- iteration 4/10 ---
+  [llm] OpenAI tokens: in=8733, out=16329
+  generated in 292.1s; evaluating...
+  score = 0.2466 (seed = 0.2456, best = 0.2744)
+              t3_B4K:    0.28 ms,     4.9 Gmodmul/s (int64) (9.2%)  [reps 0.27-0.28 ms]
+             t3_B64K:    1.20 ms,    18.1 Gmodmul/s (int64) (34.0%)  [reps 1.19-1.20 ms]
+              t3_B1M:   13.60 ms,    25.5 Gmodmul/s (int64) (47.8%)  [reps 13.59-13.60 ms]
+
+--- iteration 5/10 ---
+  [llm] OpenAI tokens: in=9417, out=17978
+  generated in 308.8s; evaluating...
+  score = 0.2421 (seed = 0.2456, best = 0.2744)
+              t3_B4K:    0.29 ms,     4.7 Gmodmul/s (int64) (8.8%)  [reps 0.29-0.29 ms]
+             t3_B64K:    1.22 ms,    17.7 Gmodmul/s (int64) (33.2%)  [reps 1.12-1.33 ms]
+              t3_B1M:   13.40 ms,    25.9 Gmodmul/s (int64) (48.6%)  [reps 13.38-13.40 ms]
+
+--- iteration 6/10 ---
+  [llm] OpenAI tokens: in=10522, out=20501
+  generated in 380.9s; evaluating...
+  score = 0.2157 (seed = 0.2456, best = 0.2744)
+              t3_B4K:    0.34 ms,     4.0 Gmodmul/s (int64) (7.6%)  [reps 0.33-0.34 ms]
+             t3_B64K:    1.33 ms,    16.3 Gmodmul/s (int64) (30.5%)  [reps 1.33-1.34 ms]
+              t3_B1M:   14.98 ms,    23.2 Gmodmul/s (int64) (43.4%)  [reps 14.96-14.99 ms]
+
+--- iteration 7/10 ---
+  [llm] OpenAI tokens: in=9888, out=13171
+  generated in 222.1s; evaluating...
+  score = 0.3076 (seed = 0.2456, best = 0.2744)
+              t3_B4K:    0.19 ms,     7.3 Gmodmul/s (int64) (13.7%)  [reps 0.18-0.19 ms]
+             t3_B64K:    1.16 ms,    18.7 Gmodmul/s (int64) (35.1%)  [reps 1.16-1.24 ms]
+              t3_B1M:   10.73 ms,    32.3 Gmodmul/s (int64) (60.6%)  [reps 10.73-10.73 ms]
+  NEW INCUMBENT
+
+--- iteration 8/10 ---
+  [llm] OpenAI tokens: in=6079, out=23089
+  generated in 398.3s; evaluating...
+  score = 0.2508 (seed = 0.2456, best = 0.3076)
+              t3_B4K:    0.30 ms,     4.6 Gmodmul/s (int64) (8.6%)  [reps 0.30-0.30 ms]
+             t3_B64K:    1.31 ms,    16.6 Gmodmul/s (int64) (31.1%)  [reps 1.23-1.35 ms]
+              t3_B1M:   11.01 ms,    31.5 Gmodmul/s (int64) (59.1%)  [reps 11.00-11.01 ms]
+
+--- iteration 9/10 ---
+  [llm] OpenAI tokens: in=11999, out=16300
+  generated in 248.6s; evaluating...
+  score = 0.2681 (seed = 0.2456, best = 0.3076)
+              t3_B4K:    0.18 ms,     7.5 Gmodmul/s (int64) (14.1%)  [reps 0.17-0.21 ms]
+             t3_B64K:    1.52 ms,    14.3 Gmodmul/s (int64) (26.7%)  [reps 1.51-1.68 ms]
+              t3_B1M:   12.70 ms,    27.3 Gmodmul/s (int64) (51.2%)  [reps 12.69-12.72 ms]
+
+--- iteration 10/10 ---
+  [llm] OpenAI tokens: in=13655, out=26822
+  generated in 494.6s; evaluating...
+  score = 0.2805 (seed = 0.2456, best = 0.3076)
+              t3_B4K:    0.25 ms,     5.4 Gmodmul/s (int64) (10.1%)  [reps 0.25-0.25 ms]
+             t3_B64K:    1.14 ms,    19.0 Gmodmul/s (int64) (35.5%)  [reps 1.04-1.17 ms]
+              t3_B1M:   10.62 ms,    32.7 Gmodmul/s (int64) (61.3%)  [reps 10.61-10.62 ms]
+
+=== done. seed=0.2456, best=0.3076, output=results/poseidon2_hash_gpt-5.5_20260516_213756 ===

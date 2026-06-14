@@ -1,0 +1,7 @@
+{
+  "compile_ok": false,
+  "correct": false,
+  "score": null,
+  "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:42:11: error: pointer type must have explicit address space qualifier\n    ulong *Aarr[25] = {\n          ^\n\" UserInfo={NSLocalizedDescription=program_source:42:11: error: pointer type must have explicit address space qualifier\n    ulong *Aarr[25] = {\n          ^\n}",
+  "sizes": []
+}

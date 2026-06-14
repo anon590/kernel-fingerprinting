@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.003666302430838368,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/00_seed.metal",
+    "elapsed_s": 0.12610197067260742,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.0070393467115362,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/01_candidate.metal",
+    "elapsed_s": 233.75973916053772,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.005380907353825932,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/02_candidate.metal",
+    "elapsed_s": 233.96260595321655,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.006727627497053976,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/03_candidate.metal",
+    "elapsed_s": 240.65723252296448,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.005499115050668452,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/04_candidate.metal",
+    "elapsed_s": 228.46043395996094,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.0053854041986306795,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/05_candidate.metal",
+    "elapsed_s": 180.52789306640625,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.007172281369140307,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/06_candidate.metal",
+    "elapsed_s": 182.5680868625641,
+    "is_new_best": true
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.005041192744476254,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/07_candidate.metal",
+    "elapsed_s": 223.42739605903625,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.00710419822130147,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/08_candidate.metal",
+    "elapsed_s": 208.7567400932312,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.006861349019321824,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/09_candidate.metal",
+    "elapsed_s": 205.28413224220276,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.004649638837112243,
+    "fail_reason": null,
+    "source_path": "results/kyber_ntt_gemini-3.1-pro-preview_20260519_100611/10_candidate.metal",
+    "elapsed_s": 257.2500729560852,
+    "is_new_best": false
+  }
+]

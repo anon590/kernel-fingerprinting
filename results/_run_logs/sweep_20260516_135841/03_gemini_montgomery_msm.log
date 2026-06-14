@@ -1,0 +1,93 @@
+
+=== Metal kernel evolution: task=montgomery_msm ===
+  model: gemini-3.1-pro-preview
+  chip:  Apple M1 Pro (peak 4500 GFLOPS fp32, 53 Gops/s int64 mul [est], 200 GB/s DRAM)
+  timing: n_warmup=3, n_measure=10, n_reps=3
+  output: results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611
+
+[seed] Evaluating seed kernel...
+  seed score: 0.0039  (80.9s)
+
+--- iteration 1/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 252.8s; evaluating...
+  score = 0.0028 (seed = 0.0039, best = 0.0039)
+             bls_N4K:  157.25 ms,     0.1 Gmodmul/s (int64) (0.2%)  [reps 157.06-157.59 ms]
+            bls_N16K:  486.95 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 484.33-487.42 ms]
+            bls_N64K: 1781.80 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 1781.29-1788.55 ms]
+
+--- iteration 2/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 180.7s; evaluating...
+  score = 0.0014 (seed = 0.0039, best = 0.0039)
+             bls_N4K:  308.12 ms,     0.1 Gmodmul/s (int64) (0.1%)  [reps 306.83-310.33 ms]
+            bls_N16K:  944.41 ms,     0.1 Gmodmul/s (int64) (0.2%)  [reps 943.43-997.12 ms]
+            bls_N64K: 3484.19 ms,     0.1 Gmodmul/s (int64) (0.2%)  [reps 3467.36-3528.55 ms]
+
+--- iteration 3/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 289.7s; evaluating...
+  score = 0.0016 (seed = 0.0039, best = 0.0039)
+             bls_N4K:  260.93 ms,     0.1 Gmodmul/s (int64) (0.1%)  [reps 260.39-263.23 ms]
+            bls_N16K:  812.53 ms,     0.1 Gmodmul/s (int64) (0.2%)  [reps 812.52-814.24 ms]
+            bls_N64K: 3081.97 ms,     0.1 Gmodmul/s (int64) (0.2%)  [reps 2997.71-3219.26 ms]
+
+--- iteration 4/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 321.8s; evaluating...
+  score = 0.0013 (seed = 0.0039, best = 0.0039)
+             bls_N4K:  331.78 ms,     0.1 Gmodmul/s (int64) (0.1%)  [reps 331.64-331.92 ms]
+            bls_N16K: 1051.37 ms,     0.1 Gmodmul/s (int64) (0.1%)  [reps 1044.72-1109.40 ms]
+            bls_N64K: 3939.52 ms,     0.1 Gmodmul/s (int64) (0.1%)  [reps 3880.72-3947.74 ms]
+
+--- iteration 5/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 275.8s; evaluating...
+  score = 0.0044 (seed = 0.0039, best = 0.0039)
+             bls_N4K:   97.08 ms,     0.2 Gmodmul/s (int64) (0.4%)  [reps 96.90-99.99 ms]
+            bls_N16K:  319.58 ms,     0.2 Gmodmul/s (int64) (0.4%)  [reps 307.17-327.12 ms]
+            bls_N64K: 1059.84 ms,     0.3 Gmodmul/s (int64) (0.5%)  [reps 1056.78-1060.30 ms]
+  NEW INCUMBENT
+
+--- iteration 6/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 304.8s; evaluating...
+  score = 0.0039 (seed = 0.0039, best = 0.0044)
+             bls_N4K:  110.20 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 110.04-110.26 ms]
+            bls_N16K:  347.10 ms,     0.2 Gmodmul/s (int64) (0.4%)  [reps 345.26-348.46 ms]
+            bls_N64K: 1220.04 ms,     0.2 Gmodmul/s (int64) (0.5%)  [reps 1216.25-1222.20 ms]
+
+--- iteration 7/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 244.1s; evaluating...
+  score = 0.0043 (seed = 0.0039, best = 0.0044)
+             bls_N4K:  103.48 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 103.26-103.58 ms]
+            bls_N16K:  324.52 ms,     0.2 Gmodmul/s (int64) (0.4%)  [reps 322.76-330.17 ms]
+            bls_N64K: 1093.54 ms,     0.3 Gmodmul/s (int64) (0.5%)  [reps 1086.71-1100.21 ms]
+
+--- iteration 8/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 273.9s; evaluating...
+  score = 0.0042 (seed = 0.0039, best = 0.0044)
+             bls_N4K:  101.54 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 101.18-101.78 ms]
+            bls_N16K:  325.83 ms,     0.2 Gmodmul/s (int64) (0.4%)  [reps 325.53-326.58 ms]
+            bls_N64K: 1130.82 ms,     0.3 Gmodmul/s (int64) (0.5%)  [reps 1130.10-1131.70 ms]
+
+--- iteration 9/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 291.7s; evaluating...
+  score = 0.0070 (seed = 0.0039, best = 0.0044)
+             bls_N4K:   64.73 ms,     0.3 Gmodmul/s (int64) (0.5%)  [reps 62.80-66.11 ms]
+            bls_N16K:  191.80 ms,     0.4 Gmodmul/s (int64) (0.7%)  [reps 190.56-195.31 ms]
+            bls_N64K:  681.11 ms,     0.4 Gmodmul/s (int64) (0.8%)  [reps 678.90-681.61 ms]
+  NEW INCUMBENT
+
+--- iteration 10/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 290.0s; evaluating...
+  score = 0.0032 (seed = 0.0039, best = 0.0070)
+             bls_N4K:  119.28 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 118.96-119.29 ms]
+            bls_N16K:  449.57 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 449.55-451.44 ms]
+            bls_N64K: 1632.85 ms,     0.2 Gmodmul/s (int64) (0.3%)  [reps 1626.99-1639.34 ms]
+
+=== done. seed=0.0039, best=0.0070, output=results/montgomery_msm_gemini-3.1-pro-preview_20260516_161611 ===

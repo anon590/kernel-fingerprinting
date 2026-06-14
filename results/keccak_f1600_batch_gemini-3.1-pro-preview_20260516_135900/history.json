@@ -1,0 +1,178 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.07536349553634346,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/00_seed.metal",
+    "elapsed_s": 17.4826922416687,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.12384641044567121,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/01_candidate.metal",
+    "elapsed_s": 224.1416163444519,
+    "is_new_best": true
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.16685157722217125,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/02_candidate.metal",
+    "elapsed_s": 269.7756190299988,
+    "is_new_best": true
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": false,
+    "score": null,
+    "fail_reason": "correctness failed at size sha3_256_B16K: bit_exact=65536",
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/03_candidate.metal",
+    "elapsed_s": 214.71830034255981,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.1979731001372354,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/04_candidate.metal",
+    "elapsed_s": 311.42090702056885,
+    "is_new_best": true
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.5393418711680308,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/05_candidate.metal",
+    "elapsed_s": 251.5447700023651,
+    "is_new_best": true
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.7127451068934515,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/06_candidate.metal",
+    "elapsed_s": 266.8116931915283,
+    "is_new_best": true
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.7423082670554976,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/07_candidate.metal",
+    "elapsed_s": 229.12794399261475,
+    "is_new_best": true
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.6299548591156616,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/08_candidate.metal",
+    "elapsed_s": 275.7033338546753,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.7410471047056874,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/09_candidate.metal",
+    "elapsed_s": 245.2241621017456,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.7442965949327547,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/10_candidate.metal",
+    "elapsed_s": 258.15497612953186,
+    "is_new_best": true
+  },
+  {
+    "iteration": 11,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.7844114974623938,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/11_candidate.metal",
+    "elapsed_s": 315.67695021629333,
+    "is_new_best": true
+  },
+  {
+    "iteration": 12,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.6258435422666265,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/12_candidate.metal",
+    "elapsed_s": 253.32030200958252,
+    "is_new_best": false
+  },
+  {
+    "iteration": 13,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.6823239625502059,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/13_candidate.metal",
+    "elapsed_s": 289.2856812477112,
+    "is_new_best": false
+  },
+  {
+    "iteration": 14,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.7357203249695974,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/14_candidate.metal",
+    "elapsed_s": 234.9961667060852,
+    "is_new_best": false
+  },
+  {
+    "iteration": 15,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.7819277060076262,
+    "fail_reason": null,
+    "source_path": "results/keccak_f1600_batch_gemini-3.1-pro-preview_20260516_135900/15_candidate.metal",
+    "elapsed_s": 280.3412001132965,
+    "is_new_best": false
+  }
+]

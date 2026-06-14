@@ -1,0 +1,132 @@
+{
+  "task": "binius_clmul",
+  "model": "claude-opus-4-7",
+  "chip": "Apple M1 Pro",
+  "n_iterations": 10,
+  "seed_score": 0.09374361344761027,
+  "best_score": 0.1968326329985548,
+  "improvement": 2.0996911230497535,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.09374361344761027,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/00_seed.metal",
+      "elapsed_s": 0.5062422752380371,
+      "is_new_best": true
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.13334647948496645,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/01_candidate.metal",
+      "elapsed_s": 40.89430785179138,
+      "is_new_best": true
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.015705774360255838,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/02_candidate.metal",
+      "elapsed_s": 64.00251698493958,
+      "is_new_best": false
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.06747492095709441,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/03_candidate.metal",
+      "elapsed_s": 46.514244079589844,
+      "is_new_best": false
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": false,
+      "score": null,
+      "fail_reason": "correctness failed at size gf128_N64K: bit_exact=127044",
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/04_candidate.metal",
+      "elapsed_s": 42.86508774757385,
+      "is_new_best": false
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.1968326329985548,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/05_candidate.metal",
+      "elapsed_s": 37.49033522605896,
+      "is_new_best": true
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.005137511647774921,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/06_candidate.metal",
+      "elapsed_s": 53.18148708343506,
+      "is_new_best": false
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.19050926091718207,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/07_candidate.metal",
+      "elapsed_s": 35.28653907775879,
+      "is_new_best": false
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.16311056561122353,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/08_candidate.metal",
+      "elapsed_s": 36.31365656852722,
+      "is_new_best": false
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.06778906919646194,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/09_candidate.metal",
+      "elapsed_s": 40.345462799072266,
+      "is_new_best": false
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.05651479479011732,
+      "fail_reason": null,
+      "source_path": "results/binius_clmul_claude-opus-4-7_20260517_172042/10_candidate.metal",
+      "elapsed_s": 37.09559679031372,
+      "is_new_best": false
+    }
+  ]
+}

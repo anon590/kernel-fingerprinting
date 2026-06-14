@@ -1,0 +1,123 @@
+[
+  {
+    "iteration": 0,
+    "role": "seed",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.21761249297753446,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/00_seed.metal",
+    "elapsed_s": 1.4801750183105469,
+    "is_new_best": true
+  },
+  {
+    "iteration": 1,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.18904968128490696,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/01_candidate.metal",
+    "elapsed_s": 126.1901113986969,
+    "is_new_best": false
+  },
+  {
+    "iteration": 2,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.18827525508722365,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/02_candidate.metal",
+    "elapsed_s": 104.3276731967926,
+    "is_new_best": false
+  },
+  {
+    "iteration": 3,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2053627182433149,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/03_candidate.metal",
+    "elapsed_s": 107.40883803367615,
+    "is_new_best": false
+  },
+  {
+    "iteration": 4,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.2073443237893328,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/04_candidate.metal",
+    "elapsed_s": 108.7856559753418,
+    "is_new_best": false
+  },
+  {
+    "iteration": 5,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.19886933757166647,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/05_candidate.metal",
+    "elapsed_s": 159.64731407165527,
+    "is_new_best": false
+  },
+  {
+    "iteration": 6,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.19491010468308512,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/06_candidate.metal",
+    "elapsed_s": 148.58897733688354,
+    "is_new_best": false
+  },
+  {
+    "iteration": 7,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.18109850731209265,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/07_candidate.metal",
+    "elapsed_s": 115.5809416770935,
+    "is_new_best": false
+  },
+  {
+    "iteration": 8,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.21368669531126186,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/08_candidate.metal",
+    "elapsed_s": 131.90390706062317,
+    "is_new_best": false
+  },
+  {
+    "iteration": 9,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": false,
+    "score": null,
+    "fail_reason": "correctness failed at size f2_N64K: bit_exact=32767",
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/09_candidate.metal",
+    "elapsed_s": 150.5153682231903,
+    "is_new_best": false
+  },
+  {
+    "iteration": 10,
+    "role": "candidate",
+    "compile_ok": true,
+    "correct": true,
+    "score": 0.19720059347440477,
+    "fail_reason": null,
+    "source_path": "results/fri_round_gemini-3.5-flash_20260525_212850/10_candidate.metal",
+    "elapsed_s": 166.2906060218811,
+    "is_new_best": false
+  }
+]

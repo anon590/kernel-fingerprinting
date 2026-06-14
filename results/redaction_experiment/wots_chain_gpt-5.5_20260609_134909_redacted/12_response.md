@@ -1,0 +1,1 @@
+I specialize the first Keccak round for the fixed sparse SHA3 single-block state used at each chain step, folding the reset/padding and round-0 theta into one macro for common `n_lanes` values. This removes per-step reset writes and avoids recomputing theta over known-zero lanes, while preserving the same bit-interleaved 32-bit Keccak core that performed well previously.

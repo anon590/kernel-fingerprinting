@@ -1,0 +1,9 @@
+**Optimizing Metal kernel**
+
+I need to improve the Metal kernel, focusing on optimization. The previous implementation was correct but didn't score well. I'm considering the Kyber NTT tasks with n=256, q=3329, and possibly seven levels. It looks like for each level, I need to understand how the zetas and stages work. I'm aiming to enhance performance by potentially avoiding threadgroup memory altogether, as each thread could compute one butterfly per level. Ultimately, I need to ensure all 256 coefficients are output efficiently.
+**Analyzing fast path performance**
+
+The fast path has several stages, starting from level 0 where the device writes 256 values to the threadgroup, followed by a barrier. In level 1, the threadgroup uses another barrier, and then on level 2, it reads chunks into registers. For output, I handle 256 loads and stores with 3 barriers per polynomial. With 896 multiplications per polynomial, the performance needs improvement. I wonder if the mod_mul_3329 is accurate, and I might optimize using Montgomery multiplication for simplicity in reduction. I need to verify if the current method is indeed exact.
+**Considering thread partitioning**
+
+I’m thinking about setting up 32 threads, but it seems I’m actually launching 128 threads. I wonder if I could partition the low lanes among SIMD groups in a way that each group handles 8 of those low positional lanes. It feels like a logical approach to utilize the resources efficiently. Let's see if that setup maximizes performance while still being manageable. I want to ensure that I’m optimizing my execution effectively!

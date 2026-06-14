@@ -1,0 +1,20 @@
+{
+  "compile_ok": true,
+  "correct": false,
+  "score": null,
+  "fail_reason": "correctness failed at size kyb_B1: bit_exact=256",
+  "sizes": [
+    {
+      "label": "kyb_B1",
+      "correct": false,
+      "error_value": 256,
+      "error_kind": "bit_exact",
+      "gpu_seconds": 3.337499947519973e-05,
+      "achieved": 0.07670412105630993,
+      "achieved_unit": "GB/s",
+      "ceiling": 200.0,
+      "ceiling_unit": "GB/s",
+      "fraction_of_ceiling": 0.00038352060528154964
+    }
+  ]
+}

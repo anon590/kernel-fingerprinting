@@ -1,0 +1,11776 @@
+## Task: wots_chain
+
+Batched WOTS+ / SPHINCS+-style hash chains. Given ``n_chains`` independent ``n_bytes``-byte seeds, apply the Keccak-256 inner hash ``w`` times in sequence per chain (each digest truncated to ``n_bytes`` bytes before feeding into the next iteration) and write the chain tip to the output. The chains are embarrassingly parallel; the ``w``-step iteration along each chain is strictly sequential.
+
+Inner hash: Keccak-f[1600] with the FIPS 202 SHA3-256 sponge framing -- rate = 136 bytes (17 lanes), capacity = 64 bytes, domain pad byte = 0x06. State convention: the 1600-bit state is a 5x5 array of 64-bit lanes; lane k = x + 5*y holds bytes 8*k .. 8*k + 7 of the sponge state in little-endian.
+
+All test sizes have ``n_bytes < rate_bytes`` (``n_bytes`` is bound at runtime and varies across the configurations the kernel is scored on; rate_bytes=136), so every chain step collapses to a single-block absorb + single-block squeeze of ``n_lanes = n_bytes / 8`` state lanes:
+  state                          := 0
+  state[lane 0..n_lanes-1]       := previous_chunk
+  state[lane n_lanes, byte 0]    ^= 0x06   # SHA3 domain
+  state[lane 16, byte 7]         ^= 0x80   # FIPS 202 final pad
+  state                          := Keccak-f1600(state)
+  next_chunk                     := state[lane 0..n_lanes-1]
+
+On the first chain step the absorb is the seed; on every subsequent step the absorb is the n_lanes-lane truncation of the previous Keccak-f1600 output. After ``w`` steps the first n_lanes state lanes are written to the output as the chain tip.
+
+The kernel must read ``n_bytes`` and ``w`` from the bound device buffers rather than treating them as compile-time constants; both vary across the test sizes (``w`` in {16, 64, 256} among the baseline sizes shown; both ``w`` and ``n_bytes`` are bound at runtime and vary across the configurations the kernel is scored on). Hardcoding either value silently produces wrong output, not just slow output.
+
+Correctness is bit-exact against ``hashlib.sha3_256`` iterated ``w`` times with ``n_bytes``-byte truncation; any mismatched output ulong rejects the candidate.
+
+## Required kernel signature(s)
+
+```
+kernel void wots_chain(
+    device const ulong *seeds    [[buffer(0)]],
+    device       ulong *tips     [[buffer(1)]],
+    constant uint      &n_chains [[buffer(2)]],
+    constant uint      &n_bytes  [[buffer(3)]],
+    constant uint      &w        [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]);
+
+Dispatch (host-fixed):
+  threadsPerGrid        = (n_chains, 1, 1)
+  threadsPerThreadgroup = (min(n_chains, 64), 1, 1)
+Each thread processes ONE chain end-to-end; guard against idx >= n_chains (the grid is rounded up to a multiple of the TG width). ``seeds`` is laid out as n_chains consecutive runs of ``n_bytes / 8`` ulongs; ``tips`` likewise. The external buffer layout above must be preserved and the per-chain sequential semantics honored: each chain's step ``j+1`` must read the digest produced by its own step ``j`` (cross-chain mixing of intermediate digests would be a correctness bug).
+```
+
+## Your previous attempt
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+constexpr uint morton_compress(uint x) {
+    x &= 0x55555555;
+    x = (x ^ (x >> 1)) & 0x33333333;
+    x = (x ^ (x >> 2)) & 0x0f0f0f0f;
+    x = (x ^ (x >> 4)) & 0x00ff00ff;
+    x = (x ^ (x >> 8)) & 0x0000ffff;
+    return x;
+}
+
+constexpr uint2 to_interleaved(ulong V) {
+    uint lo = (uint)V;
+    uint hi = (uint)(V >> 32);
+    uint e = morton_compress(lo) | (morton_compress(hi) << 16);
+    uint o = morton_compress(lo >> 1) | (morton_compress(hi >> 1) << 16);
+    return uint2(e, o);
+}
+
+constexpr uint morton_expand(uint x) {
+    x &= 0x0000ffff;
+    x = (x ^ (x << 8)) & 0x00ff00ff;
+    x = (x ^ (x << 4)) & 0x0f0f0f0f;
+    x = (x ^ (x << 2)) & 0x33333333;
+    x = (x ^ (x << 1)) & 0x55555555;
+    return x;
+}
+
+constexpr ulong from_interleaved(uint2 V) {
+    uint lo = morton_expand(V.x) | (morton_expand(V.y) << 1);
+    uint hi = morton_expand(V.x >> 16) | (morton_expand(V.y >> 16) << 1);
+    return ((ulong)hi << 32) | lo;
+}
+
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+
+#define ROT(X, k) \
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+
+#define K_ROUND(rc) \
+    do { \
+        uint2 C0 = A00 ^ A01 ^ A02 ^ A03 ^ A04; \
+        uint2 C1 = A10 ^ A11 ^ A12 ^ A13 ^ A14; \
+        uint2 C2 = A20 ^ A21 ^ A22 ^ A23 ^ A24; \
+        uint2 C3 = A30 ^ A31 ^ A32 ^ A33 ^ A34; \
+        uint2 C4 = A40 ^ A41 ^ A42 ^ A43 ^ A44; \
+        \
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+        \
+        uint2 B00 = A00 ^ D0; \
+        uint2 B10 = ROT(A11 ^ D1, 44); \
+        uint2 B20 = ROT(A22 ^ D2, 43); \
+        uint2 B30 = ROT(A33 ^ D3, 21); \
+        uint2 B40 = ROT(A44 ^ D4, 14); \
+        \
+        uint2 B01 = ROT(A30 ^ D3, 28); \
+        uint2 B11 = ROT(A41 ^ D4, 20); \
+        uint2 B21 = ROT(A02 ^ D0,  3); \
+        uint2 B31 = ROT(A13 ^ D1, 45); \
+        uint2 B41 = ROT(A24 ^ D2, 61); \
+        \
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+        uint2 B12 = ROT(A21 ^ D2,  6); \
+        uint2 B22 = ROT(A32 ^ D3, 25); \
+        uint2 B32 = ROT(A43 ^ D4,  8); \
+        uint2 B42 = ROT(A04 ^ D0, 18); \
+        \
+        uint2 B03 = ROT(A40 ^ D4, 27); \
+        uint2 B13 = ROT(A01 ^ D0, 36); \
+        uint2 B23 = ROT(A12 ^ D1, 10); \
+        uint2 B33 = ROT(A23 ^ D2, 15); \
+        uint2 B43 = ROT(A34 ^ D3, 56); \
+        \
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+        uint2 B14 = ROT(A31 ^ D3, 55); \
+        uint2 B24 = ROT(A42 ^ D4, 39); \
+        uint2 B34 = ROT(A03 ^ D0, 41); \
+        uint2 B44 = ROT(A14 ^ D1,  2); \
+        \
+        A00 = B00 ^ (~B10 & B20); \
+        constexpr uint2 RC = to_interleaved(rc); \
+        if (RC.x) A00.x ^= RC.x; \
+        if (RC.y) A00.y ^= RC.y; \
+        A10 = B10 ^ (~B20 & B30); \
+        A20 = B20 ^ (~B30 & B40); \
+        A30 = B30 ^ (~B40 & B00); \
+        A40 = B40 ^ (~B00 & B10); \
+        \
+        A01 = B01 ^ (~B11 & B21); \
+        A11 = B11 ^ (~B21 & B31); \
+        A21 = B21 ^ (~B31 & B41); \
+        A31 = B31 ^ (~B41 & B01); \
+        A41 = B41 ^ (~B01 & B11); \
+        \
+        A02 = B02 ^ (~B12 & B22); \
+        A12 = B12 ^ (~B22 & B32); \
+        A22 = B22 ^ (~B32 & B42); \
+        A32 = B32 ^ (~B42 & B02); \
+        A42 = B42 ^ (~B02 & B12); \
+        \
+        A03 = B03 ^ (~B13 & B23); \
+        A13 = B13 ^ (~B23 & B33); \
+        A23 = B23 ^ (~B33 & B43); \
+        A33 = B33 ^ (~B43 & B03); \
+        A43 = B43 ^ (~B03 & B13); \
+        \
+        A04 = B04 ^ (~B14 & B24); \
+        A14 = B14 ^ (~B24 & B34); \
+        A24 = B24 ^ (~B34 & B44); \
+        A34 = B34 ^ (~B44 & B04); \
+        A44 = B44 ^ (~B04 & B14); \
+    } while (0)
+
+kernel void wots_chain(
+    device const ulong *seeds    [[buffer(0)]],
+    device       ulong *tips     [[buffer(1)]],
+    constant uint      &n_chains [[buffer(2)]],
+    constant uint      &n_bytes  [[buffer(3)]],
+    constant uint      &w        [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= n_chains) return;
+
+    uint n_lanes = n_bytes >> 3;
+    uint base = tid * n_lanes;
+
+    uint2 A00 = uint2(0); uint2 A10 = uint2(0); uint2 A20 = uint2(0); uint2 A30 = uint2(0); uint2 A40 = uint2(0);
+    uint2 A01 = uint2(0); uint2 A11 = uint2(0); uint2 A21 = uint2(0); uint2 A31 = uint2(0); uint2 A41 = uint2(0);
+    uint2 A02 = uint2(0); uint2 A12 = uint2(0); uint2 A22 = uint2(0); uint2 A32 = uint2(0); uint2 A42 = uint2(0);
+    uint2 A03 = uint2(0); uint2 A13 = uint2(0); uint2 A23 = uint2(0); uint2 A33 = uint2(0); uint2 A43 = uint2(0);
+    uint2 A04 = uint2(0); uint2 A14 = uint2(0); uint2 A24 = uint2(0); uint2 A34 = uint2(0); uint2 A44 = uint2(0);
+
+    if (0 < n_lanes) A00 = to_interleaved(seeds[base + 0]);
+    if (1 < n_lanes) A10 = to_interleaved(seeds[base + 1]);
+    if (2 < n_lanes) A20 = to_interleaved(seeds[base + 2]);
+    if (3 < n_lanes) A30 = to_interleaved(seeds[base + 3]);
+    if (4 < n_lanes) A40 = to_interleaved(seeds[base + 4]);
+
+    if (5 < n_lanes) A01 = to_interleaved(seeds[base + 5]);
+    if (6 < n_lanes) A11 = to_interleaved(seeds[base + 6]);
+    if (7 < n_lanes) A21 = to_interleaved(seeds[base + 7]);
+    if (8 < n_lanes) A31 = to_interleaved(seeds[base + 8]);
+    if (9 < n_lanes) A41 = to_interleaved(seeds[base + 9]);
+
+    if (10 < n_lanes) A02 = to_interleaved(seeds[base + 10]);
+    if (11 < n_lanes) A12 = to_interleaved(seeds[base + 11]);
+    if (12 < n_lanes) A22 = to_interleaved(seeds[base + 12]);
+    if (13 < n_lanes) A32 = to_interleaved(seeds[base + 13]);
+    if (14 < n_lanes) A42 = to_interleaved(seeds[base + 14]);
+
+    if (15 < n_lanes) A03 = to_interleaved(seeds[base + 15]);
+
+    constexpr uint2 pad06 = to_interleaved(0x06ul);
+    constexpr uint2 PAD16_16 = to_interleaved(0x8000000000000006ul);
+    constexpr uint2 PAD16_OTHERS = to_interleaved(0x8000000000000000ul);
+    uint2 pad16 = (n_lanes == 16) ? PAD16_16 : PAD16_OTHERS;
+
+    for (uint step = 0u; step < w; ++step) {
+        
+        switch (n_lanes) {
+            case 0: A00 = pad06; goto L10;
+            case 1: A10 = pad06; goto L20;
+            case 2: A20 = pad06; goto L30;
+            case 3: A30 = pad06; goto L40;
+            case 4: A40 = pad06; goto L01;
+            case 5: A01 = pad06; goto L11;
+            case 6: A11 = pad06; goto L21;
+            case 7: A21 = pad06; goto L31;
+            case 8: A31 = pad06; goto L41;
+            case 9: A41 = pad06; goto L02;
+            case 10: A02 = pad06; goto L12;
+            case 11: A12 = pad06; goto L22;
+            case 12: A22 = pad06; goto L32;
+            case 13: A32 = pad06; goto L42;
+            case 14: A42 = pad06; goto L03;
+            case 15: A03 = pad06; goto LDONE;
+        }
+        goto LDONE;
+        
+        L10: A10 = uint2(0);
+        L20: A20 = uint2(0);
+        L30: A30 = uint2(0);
+        L40: A40 = uint2(0);
+        L01: A01 = uint2(0);
+        L11: A11 = uint2(0);
+        L21: A21 = uint2(0);
+        L31: A31 = uint2(0);
+        L41: A41 = uint2(0);
+        L02: A02 = uint2(0);
+        L12: A12 = uint2(0);
+        L22: A22 = uint2(0);
+        L32: A32 = uint2(0);
+        L42: A42 = uint2(0);
+        L03: A03 = uint2(0);
+        LDONE: ;
+
+        A13 = pad16;
+        
+        A23 = uint2(0);
+        A33 = uint2(0);
+        A43 = uint2(0);
+        A04 = uint2(0);
+        A14 = uint2(0);
+        A24 = uint2(0);
+        A34 = uint2(0);
+        A44 = uint2(0);
+
+        K_ROUND(0x0000000000000001ul);
+        K_ROUND(0x0000000000008082ul);
+        K_ROUND(0x800000000000808Aul);
+        K_ROUND(0x8000000080008000ul);
+        K_ROUND(0x000000000000808Bul);
+        K_ROUND(0x0000000080000001ul);
+        K_ROUND(0x8000000080008081ul);
+        K_ROUND(0x8000000000008009ul);
+        K_ROUND(0x000000000000008Aul);
+        K_ROUND(0x0000000000000088ul);
+        K_ROUND(0x0000000080008009ul);
+        K_ROUND(0x000000008000000Aul);
+        K_ROUND(0x000000008000808Bul);
+        K_ROUND(0x800000000000008Bul);
+        K_ROUND(0x8000000000008089ul);
+        K_ROUND(0x8000000000008003ul);
+        K_ROUND(0x8000000000008002ul);
+        K_ROUND(0x8000000000000080ul);
+        K_ROUND(0x000000000000800Aul);
+        K_ROUND(0x800000008000000Aul);
+        K_ROUND(0x8000000080008081ul);
+        K_ROUND(0x8000000000008080ul);
+        K_ROUND(0x0000000080000001ul);
+        K_ROUND(0x8000000080008008ul);
+    }
+
+    if (0 < n_lanes) tips[base + 0] = from_interleaved(A00);
+    if (1 < n_lanes) tips[base + 1] = from_interleaved(A10);
+    if (2 < n_lanes) tips[base + 2] = from_interleaved(A20);
+    if (3 < n_lanes) tips[base + 3] = from_interleaved(A30);
+    if (4 < n_lanes) tips[base + 4] = from_interleaved(A40);
+
+    if (5 < n_lanes) tips[base + 5] = from_interleaved(A01);
+    if (6 < n_lanes) tips[base + 6] = from_interleaved(A11);
+    if (7 < n_lanes) tips[base + 7] = from_interleaved(A21);
+    if (8 < n_lanes) tips[base + 8] = from_interleaved(A31);
+    if (9 < n_lanes) tips[base + 9] = from_interleaved(A41);
+
+    if (10 < n_lanes) tips[base + 10] = from_interleaved(A02);
+    if (11 < n_lanes) tips[base + 11] = from_interleaved(A12);
+    if (12 < n_lanes) tips[base + 12] = from_interleaved(A22);
+    if (13 < n_lanes) tips[base + 13] = from_interleaved(A32);
+    if (14 < n_lanes) tips[base + 14] = from_interleaved(A42);
+
+    if (15 < n_lanes) tips[base + 15] = from_interleaved(A03);
+}
+```
+
+Result of previous attempt:
+  COMPILE FAILED: Error Domain=MTLLibraryErrorDomain Code=3 "program_source:167:34: error: 'goto' is not supported in Metal
+            case 0: A00 = pad06; goto L10;
+                                 ^
+program_source:168:34: error: 'goto' is not supported in Metal
+            case 1: A10 = pad06; goto L20;
+                                 ^
+program_source:169:34: error: 'goto' is not supported in Metal
+            case 2: A20 = pad06; goto L30;
+                                 ^
+program_source:170:34: error: 'goto' is not supported in Metal
+            case 3: A30 = pad06; goto L40;
+                                 ^
+program_source:171:34: error: 'goto' is not supported in Metal
+            case 4: A40 = pad06; goto L01;
+                                 ^
+program_source:172:34: error: 'goto' is not supported in Metal
+            case 5: A01 = pad06; goto L11;
+                                 ^
+program_source:173:34: error: 'goto' is not supported in Metal
+            case 6: A11 = pad06; goto L21;
+                                 ^
+program_source:174:34: error: 'goto' is not supported in Metal
+            case 7: A21 = pad06; goto L31;
+                                 ^
+program_source:175:34: error: 'goto' is not supported in Metal
+            case 8: A31 = pad06; goto L41;
+                                 ^
+program_source:176:34: error: 'goto' is not supported in Metal
+            case 9: A41 = pad06; goto L02;
+                                 ^
+program_source:177:35: error: 'goto' is not supported in Metal
+            case 10: A02 = pad06; goto L12;
+                                  ^
+program_source:178:35: error: 'goto' is not supported in Metal
+            case 11: A12 = pad06; goto L22;
+                                  ^
+program_source:179:35: error: 'goto' is not supported in Metal
+            case 12: A22 = pad06; goto L32;
+                                  ^
+program_source:180:35: error: 'goto' is not supported in Metal
+            case 13: A32 = pad06; goto L42;
+                                  ^
+program_source:181:35: error: 'goto' is not supported in Metal
+            case 14: A42 = pad06; goto L03;
+                                  ^
+program_source:182:35: error: 'goto' is not supported in Metal
+            case 15: A03 = pad06; goto LDONE;
+                                  ^
+program_source:184:9: error: 'goto' is not supported in Metal
+        goto LDONE;
+        ^
+program_source:186:12: error: labeled statements are not supported in Metal
+        L10: A10 = uint2(0);
+           ^
+program_source:187:12: error: labeled statements are not supported in Metal
+        L20: A20 = uint2(0);
+           ^
+program_source:188:12: error: labeled statements are not supported in Metal
+        L30: A30 = uint2(0);
+           ^
+program_source:189:12: error: labeled statements are not supported in Metal
+        L40: A40 = uint2(0);
+           ^
+program_source:190:12: error: labeled statements are not supported in Metal
+        L01: A01 = uint2(0);
+           ^
+program_source:191:12: error: labeled statements are not supported in Metal
+        L11: A11 = uint2(0);
+           ^
+program_source:192:12: error: labeled statements are not supported in Metal
+        L21: A21 = uint2(0);
+           ^
+program_source:193:12: error: labeled statements are not supported in Metal
+        L31: A31 = uint2(0);
+           ^
+program_source:194:12: error: labeled statements are not supported in Metal
+        L41: A41 = uint2(0);
+           ^
+program_source:195:12: error: labeled statements are not supported in Metal
+        L02: A02 = uint2(0);
+           ^
+program_source:196:12: error: labeled statements are not supported in Metal
+        L12: A12 = uint2(0);
+           ^
+program_source:197:12: error: labeled statements are not supported in Metal
+        L22: A22 = uint2(0);
+           ^
+program_source:198:12: error: labeled statements are not supported in Metal
+        L32: A32 = uint2(0);
+           ^
+program_source:199:12: error: labeled statements are not supported in Metal
+        L42: A42 = uint2(0);
+           ^
+program_source:200:12: error: labeled statements are not supported in Metal
+        L03: A03 = uint2(0);
+           ^
+program_source:201:14: error: labeled statements are not supported in Metal
+        LDONE: ;
+             ^
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+" UserInfo={NSLocalizedDescription=program_source:167:34: error: 'goto' is not supported in Metal
+            case 0: A00 = pad06; goto L10;
+                                 ^
+program_source:168:34: error: 'goto' is not supported in Metal
+            case 1: A10 = pad06; goto L20;
+                                 ^
+program_source:169:34: error: 'goto' is not supported in Metal
+            case 2: A20 = pad06; goto L30;
+                                 ^
+program_source:170:34: error: 'goto' is not supported in Metal
+            case 3: A30 = pad06; goto L40;
+                                 ^
+program_source:171:34: error: 'goto' is not supported in Metal
+            case 4: A40 = pad06; goto L01;
+                                 ^
+program_source:172:34: error: 'goto' is not supported in Metal
+            case 5: A01 = pad06; goto L11;
+                                 ^
+program_source:173:34: error: 'goto' is not supported in Metal
+            case 6: A11 = pad06; goto L21;
+                                 ^
+program_source:174:34: error: 'goto' is not supported in Metal
+            case 7: A21 = pad06; goto L31;
+                                 ^
+program_source:175:34: error: 'goto' is not supported in Metal
+            case 8: A31 = pad06; goto L41;
+                                 ^
+program_source:176:34: error: 'goto' is not supported in Metal
+            case 9: A41 = pad06; goto L02;
+                                 ^
+program_source:177:35: error: 'goto' is not supported in Metal
+            case 10: A02 = pad06; goto L12;
+                                  ^
+program_source:178:35: error: 'goto' is not supported in Metal
+            case 11: A12 = pad06; goto L22;
+                                  ^
+program_source:179:35: error: 'goto' is not supported in Metal
+            case 12: A22 = pad06; goto L32;
+                                  ^
+program_source:180:35: error: 'goto' is not supported in Metal
+            case 13: A32 = pad06; goto L42;
+                                  ^
+program_source:181:35: error: 'goto' is not supported in Metal
+            case 14: A42 = pad06; goto L03;
+                                  ^
+program_source:182:35: error: 'goto' is not supported in Metal
+            case 15: A03 = pad06; goto LDONE;
+                                  ^
+program_source:184:9: error: 'goto' is not supported in Metal
+        goto LDONE;
+        ^
+program_source:186:12: error: labeled statements are not supported in Metal
+        L10: A10 = uint2(0);
+           ^
+program_source:187:12: error: labeled statements are not supported in Metal
+        L20: A20 = uint2(0);
+           ^
+program_source:188:12: error: labeled statements are not supported in Metal
+        L30: A30 = uint2(0);
+           ^
+program_source:189:12: error: labeled statements are not supported in Metal
+        L40: A40 = uint2(0);
+           ^
+program_source:190:12: error: labeled statements are not supported in Metal
+        L01: A01 = uint2(0);
+           ^
+program_source:191:12: error: labeled statements are not supported in Metal
+        L11: A11 = uint2(0);
+           ^
+program_source:192:12: error: labeled statements are not supported in Metal
+        L21: A21 = uint2(0);
+           ^
+program_source:193:12: error: labeled statements are not supported in Metal
+        L31: A31 = uint2(0);
+           ^
+program_source:194:12: error: labeled statements are not supported in Metal
+        L41: A41 = uint2(0);
+           ^
+program_source:195:12: error: labeled statements are not supported in Metal
+        L02: A02 = uint2(0);
+           ^
+program_source:196:12: error: labeled statements are not supported in Metal
+        L12: A12 = uint2(0);
+           ^
+program_source:197:12: error: labeled statements are not supported in Metal
+        L22: A22 = uint2(0);
+           ^
+program_source:198:12: error: labeled statements are not supported in Metal
+        L32: A32 = uint2(0);
+           ^
+program_source:199:12: error: labeled statements are not supported in Metal
+        L42: A42 = uint2(0);
+           ^
+program_source:200:12: error: labeled statements are not supported in Metal
+        L03: A03 = uint2(0);
+           ^
+program_source:201:14: error: labeled statements are not supported in Metal
+        LDONE: ;
+             ^
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:214:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:215:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000008082ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:216:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000808Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:217:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008000ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:218:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:219:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:220:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:221:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:222:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000008Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:223:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000000000088ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:224:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080008009ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:225:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:226:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000008000808Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:227:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000000000008Bul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:228:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008089ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:229:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008003ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:230:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008002ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:231:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000000080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:232:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x000000000000800Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:233:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x800000008000000Aul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:234:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008081ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:235:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000000008080ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:236:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x0000000080000001ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:50:25: note: expanded from macro 'K_ROUND'
+        uint2 D0 = C4 ^ ROT(C1, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:51:25: note: expanded from macro 'K_ROUND'
+        uint2 D1 = C0 ^ ROT(C2, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:52:25: note: expanded from macro 'K_ROUND'
+        uint2 D2 = C1 ^ ROT(C3, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:53:25: note: expanded from macro 'K_ROUND'
+        uint2 D3 = C2 ^ ROT(C4, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:54:25: note: expanded from macro 'K_ROUND'
+        uint2 D4 = C3 ^ ROT(C0, 1); \
+                        ^~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:61: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:24: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:68:21: note: expanded from macro 'K_ROUND'
+        uint2 B02 = ROT(A10 ^ D1,  1); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:40:61: note: expanded from macro 'ROT'
+               : uint2(ROTL32((X).x, ((k) / 2) & 31),       ROTL32((X).y, ((k) / 2) & 31)))
+                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+program_source:237:9: warning: shift count >= width of type [-Wshift-count-overflow]
+        K_ROUND(0x8000000080008008ul);
+        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:80:21: note: expanded from macro 'K_ROUND'
+        uint2 B04 = ROT(A20 ^ D2, 62); \
+                    ^~~~~~~~~~~~~~~~~
+program_source:39:24: note: expanded from macro 'ROT'
+    (((k) & 1) ? uint2(ROTL32((X).y, (((k) / 2) + 1) & 31), ROTL32((X).x, ((k) / 2) & 31)) \
+                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+program_source:36:63: note: expanded from macro 'ROTL32'
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+                                                              ^  ~~~~~~~~~~
+}
+
+## Current best (incumbent)
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+constexpr uint morton_compress(uint x) {
+    x &= 0x55555555;
+    x = (x ^ (x >> 1)) & 0x33333333;
+    x = (x ^ (x >> 2)) & 0x0f0f0f0f;
+    x = (x ^ (x >> 4)) & 0x00ff00ff;
+    x = (x ^ (x >> 8)) & 0x0000ffff;
+    return x;
+}
+
+constexpr uint2 to_interleaved(ulong V) {
+    uint lo = (uint)V;
+    uint hi = (uint)(V >> 32);
+    uint e = morton_compress(lo) | (morton_compress(hi) << 16);
+    uint o = morton_compress(lo >> 1) | (morton_compress(hi >> 1) << 16);
+    return uint2(e, o);
+}
+
+constexpr uint morton_expand(uint x) {
+    x &= 0x0000ffff;
+    x = (x ^ (x << 8)) & 0x00ff00ff;
+    x = (x ^ (x << 4)) & 0x0f0f0f0f;
+    x = (x ^ (x << 2)) & 0x33333333;
+    x = (x ^ (x << 1)) & 0x55555555;
+    return x;
+}
+
+constexpr ulong from_interleaved(uint e, uint o) {
+    uint lo = morton_expand(e) | (morton_expand(o) << 1);
+    uint hi = morton_expand(e >> 16) | (morton_expand(o >> 16) << 1);
+    return ((ulong)hi << 32) | lo;
+}
+
+#define ROTL32(x, k) (((k) == 0) ? (x) : (((x) << (k)) | ((x) >> (32 - (k)))))
+
+#define R_E(E, O, k) (((k) & 1) ? ROTL32(O, (((k) / 2) + 1) & 31) : ROTL32(E, ((k) / 2) & 31))
+#define R_O(E, O, k) (((k) & 1) ? ROTL32(E, ((k) / 2) & 31)       : ROTL32(O, ((k) / 2) & 31))
+
+#define K_ROUND(rc) \
+    do { \
+        constexpr uint2 RC = to_interleaved(rc); \
+        \
+        uint C0_E = A00_E ^ A01_E ^ A02_E ^ A03_E ^ A04_E; \
+        uint C0_O = A00_O ^ A01_O ^ A02_O ^ A03_O ^ A04_O; \
+        uint C1_E = A10_E ^ A11_E ^ A12_E ^ A13_E ^ A14_E; \
+        uint C1_O = A10_O ^ A11_O ^ A12_O ^ A13_O ^ A14_O; \
+        uint C2_E = A20_E ^ A21_E ^ A22_E ^ A23_E ^ A24_E; \
+        uint C2_O = A20_O ^ A21_O ^ A22_O ^ A23_O ^ A24_O; \
+        uint C3_E = A30_E ^ A31_E ^ A32_E ^ A33_E ^ A34_E; \
+        uint C3_O = A30_O ^ A31_O ^ A32_O ^ A33_O ^ A34_O; \
+        uint C4_E = A40_E ^ A41_E ^ A42_E ^ A43_E ^ A44_E; \
+        uint C4_O = A40_O ^ A41_O ^ A42_O ^ A43_O ^ A44_O; \
+        \
+        uint D0_E = C4_E ^ R_E(C1_E, C1_O, 1); \
+        uint D0_O = C4_O ^ R_O(C1_E, C1_O, 1); \
+        uint D1_E = C0_E ^ R_E(C2_E, C2_O, 1); \
+        uint D1_O = C0_O ^ R_O(C2_E, C2_O, 1); \
+        uint D2_E = C1_E ^ R_E(C3_E, C3_O, 1); \
+        uint D2_O = C1_O ^ R_O(C3_E, C3_O, 1); \
+        uint D3_E = C2_E ^ R_E(C4_E, C4_O, 1); \
+        uint D3_O = C2_O ^ R_O(C4_E, C4_O, 1); \
+        uint D4_E = C3_E ^ R_E(C0_E, C0_O, 1); \
+        uint D4_O = C3_O ^ R_O(C0_E, C0_O, 1); \
+        \
+        uint B00_E = A00_E ^ D0_E; \
+        uint B00_O = A00_O ^ D0_O; \
+        \
+        uint T_E, T_O; \
+        T_E = A11_E ^ D1_E; T_O = A11_O ^ D1_O; \
+        uint B10_E = R_E(T_E, T_O, 44); uint B10_O = R_O(T_E, T_O, 44); \
+        T_E = A22_E ^ D2_E; T_O = A22_O ^ D2_O; \
+        uint B20_E = R_E(T_E, T_O, 43); uint B20_O = R_O(T_E, T_O, 43); \
+        T_E = A33_E ^ D3_E; T_O = A33_O ^ D3_O; \
+        uint B30_E = R_E(T_E, T_O, 21); uint B30_O = R_O(T_E, T_O, 21); \
+        T_E = A44_E ^ D4_E; T_O = A44_O ^ D4_O; \
+        uint B40_E = R_E(T_E, T_O, 14); uint B40_O = R_O(T_E, T_O, 14); \
+        \
+        T_E = A30_E ^ D3_E; T_O = A30_O ^ D3_O; \
+        uint B01_E = R_E(T_E, T_O, 28); uint B01_O = R_O(T_E, T_O, 28); \
+        T_E = A41_E ^ D4_E; T_O = A41_O ^ D4_O; \
+        uint B11_E = R_E(T_E, T_O, 20); uint B11_O = R_O(T_E, T_O, 20); \
+        T_E = A02_E ^ D0_E; T_O = A02_O ^ D0_O; \
+        uint B21_E = R_E(T_E, T_O,  3); uint B21_O = R_O(T_E, T_O,  3); \
+        T_E = A13_E ^ D1_E; T_O = A13_O ^ D1_O; \
+        uint B31_E = R_E(T_E, T_O, 45); uint B31_O = R_O(T_E, T_O, 45); \
+        T_E = A24_E ^ D2_E; T_O = A24_O ^ D2_O; \
+        uint B41_E = R_E(T_E, T_O, 61); uint B41_O = R_O(T_E, T_O, 61); \
+        \
+        T_E = A10_E ^ D1_E; T_O = A10_O ^ D1_O; \
+        uint B02_E = R_E(T_E, T_O,  1); uint B02_O = R_O(T_E, T_O,  1); \
+        T_E = A21_E ^ D2_E; T_O = A21_O ^ D2_O; \
+        uint B12_E = R_E(T_E, T_O,  6); uint B12_O = R_O(T_E, T_O,  6); \
+        T_E = A32_E ^ D3_E; T_O = A32_O ^ D3_O; \
+        uint B22_E = R_E(T_E, T_O, 25); uint B22_O = R_O(T_E, T_O, 25); \
+        T_E = A43_E ^ D4_E; T_O = A43_O ^ D4_O; \
+        uint B32_E = R_E(T_E, T_O,  8); uint B32_O = R_O(T_E, T_O,  8); \
+        T_E = A04_E ^ D0_E; T_O = A04_O ^ D0_O; \
+        uint B42_E = R_E(T_E, T_O, 18); uint B42_O = R_O(T_E, T_O, 18); \
+        \
+        T_E = A40_E ^ D4_E; T_O = A40_O ^ D4_O; \
+        uint B03_E = R_E(T_E, T_O, 27); uint B03_O = R_O(T_E, T_O, 27); \
+        T_E = A01_E ^ D0_E; T_O = A01_O ^ D0_O; \
+        uint B13_E = R_E(T_E, T_O, 36); uint B13_O = R_O(T_E, T_O, 36); \
+        T_E = A12_E ^ D1_E; T_O = A12_O ^ D1_O; \
+        uint B23_E = R_E(T_E, T_O, 10); uint B23_O = R_O(T_E, T_O, 10); \
+        T_E = A23_E ^ D2_E; T_O = A23_O ^ D2_O; \
+        uint B33_E = R_E(T_E, T_O, 15); uint B33_O = R_O(T_E, T_O, 15); \
+        T_E = A34_E ^ D3_E; T_O = A34_O ^ D3_O; \
+        uint B43_E = R_E(T_E, T_O, 56); uint B43_O = R_O(T_E, T_O, 56); \
+        \
+        T_E = A20_E ^ D2_E; T_O = A20_O ^ D2_O; \
+        uint B04_E = R_E(T_E, T_O, 62); uint B04_O = R_O(T_E, T_O, 62); \
+        T_E = A31_E ^ D3_E; T_O = A31_O ^ D3_O; \
+        uint B14_E = R_E(T_E, T_O, 55); uint B14_O = R_O(T_E, T_O, 55); \
+        T_E = A42_E ^ D4_E; T_O = A42_O ^ D4_O; \
+        uint B24_E = R_E(T_E, T_O, 39); uint B24_O = R_O(T_E, T_O, 39); \
+        T_E = A03_E ^ D0_E; T_O = A03_O ^ D0_O; \
+        uint B34_E = R_E(T_E, T_O, 41); uint B34_O = R_O(T_E, T_O, 41); \
+        T_E = A14_E ^ D1_E; T_O = A14_O ^ D1_O; \
+        uint B44_E = R_E(T_E, T_O,  2); uint B44_O = R_O(T_E, T_O,  2); \
+        \
+        A00_E = B00_E ^ (~B10_E & B20_E); if (RC.x) A00_E ^= RC.x; \
+        A00_O = B00_O ^ (~B10_O & B20_O); if (RC.y) A00_O ^= RC.y; \
+        A10_E = B10_E ^ (~B20_E & B30_E); A10_O = B10_O ^ (~B20_O & B30_O); \
+        A20_E = B20_E ^ (~B30_E & B40_E); A20_O = B20_O ^ (~B30_O & B40_O); \
+        A30_E = B30_E ^ (~B40_E & B00_E); A30_O = B30_O ^ (~B40_O & B00_O); \
+        A40_E = B40_E ^ (~B00_E & B10_E); A40_O = B40_O ^ (~B00_O & B10_O); \
+        \
+        A01_E = B01_E ^ (~B11_E & B21_E); A01_O = B01_O ^ (~B11_O & B21_O); \
+        A11_E = B11_E ^ (~B21_E & B31_E); A11_O = B11_O ^ (~B21_O & B31_O); \
+        A21_E = B21_E ^ (~B31_E & B41_E); A21_O = B21_O ^ (~B31_O & B41_O); \
+        A31_E = B31_E ^ (~B41_E & B01_E); A31_O = B31_O ^ (~B41_O & B01_O); \
+        A41_E = B41_E ^ (~B01_E & B11_E); A41_O = B41_O ^ (~B01_O & B11_O); \
+        \
+        A02_E = B02_E ^ (~B12_E & B22_E); A02_O = B02_O ^ (~B12_O & B22_O); \
+        A12_E = B12_E ^ (~B22_E & B32_E); A12_O = B12_O ^ (~B22_O & B32_O); \
+        A22_E = B22_E ^ (~B32_E & B42_E); A22_O = B22_O ^ (~B32_O & B42_O); \
+        A32_E = B32_E ^ (~B42_E & B02_E); A32_O = B32_O ^ (~B42_O & B02_O); \
+        A42_E = B42_E ^ (~B02_E & B12_E); A42_O = B42_O ^ (~B02_O & B12_O); \
+        \
+        A03_E = B03_E ^ (~B13_E & B23_E); A03_O = B03_O ^ (~B13_O & B23_O); \
+        A13_E = B13_E ^ (~B23_E & B33_E); A13_O = B13_O ^ (~B23_O & B33_O); \
+        A23_E = B23_E ^ (~B33_E & B43_E); A23_O = B23_O ^ (~B33_O & B43_O); \
+        A33_E = B33_E ^ (~B43_E & B03_E); A33_O = B33_O ^ (~B43_O & B03_O); \
+        A43_E = B43_E ^ (~B03_E & B13_E); A43_O = B43_O ^ (~B03_O & B13_O); \
+        \
+        A04_E = B04_E ^ (~B14_E & B24_E); A04_O = B04_O ^ (~B14_O & B24_O); \
+        A14_E = B14_E ^ (~B24_E & B34_E); A14_O = B14_O ^ (~B24_O & B34_O); \
+        A24_E = B24_E ^ (~B34_E & B44_E); A24_O = B24_O ^ (~B34_O & B44_O); \
+        A34_E = B34_E ^ (~B44_E & B04_E); A34_O = B34_O ^ (~B44_O & B04_O); \
+        A44_E = B44_E ^ (~B04_E & B14_E); A44_O = B44_O ^ (~B04_O & B14_O); \
+    } while (0)
+
+kernel void wots_chain(
+    device const ulong *seeds    [[buffer(0)]],
+    device       ulong *tips     [[buffer(1)]],
+    constant uint      &n_chains [[buffer(2)]],
+    constant uint      &n_bytes  [[buffer(3)]],
+    constant uint      &w        [[buffer(4)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid >= n_chains) return;
+
+    uint n_lanes = n_bytes >> 3;
+    uint base = tid * n_lanes;
+
+    uint A00_E = 0, A00_O = 0; uint A10_E = 0, A10_O = 0; uint A20_E = 0, A20_O = 0; uint A30_E = 0, A30_O = 0; uint A40_E = 0, A40_O = 0;
+    uint A01_E = 0, A01_O = 0; uint A11_E = 0, A11_O = 0; uint A21_E = 0, A21_O = 0; uint A31_E = 0, A31_O = 0; uint A41_E = 0, A41_O = 0;
+    uint A02_E = 0, A02_O = 0; uint A12_E = 0, A12_O = 0; uint A22_E = 0, A22_O = 0; uint A32_E = 0, A32_O = 0; uint A42_E = 0, A42_O = 0;
+    uint A03_E = 0, A03_O = 0; uint A13_E = 0, A13_O = 0; uint A23_E = 0, A23_O = 0; uint A33_E = 0, A33_O = 0; uint A43_E = 0, A43_O = 0;
+    uint A04_E = 0, A04_O = 0; uint A14_E = 0, A14_O = 0; uint A24_E = 0, A24_O = 0; uint A34_E = 0, A34_O = 0; uint A44_E = 0, A44_O = 0;
+
+    if (0 < n_lanes) { uint2 v = to_interleaved(seeds[base + 0]); A00_E = v.x; A00_O = v.y; }
+    if (1 < n_lanes) { uint2 v = to_interleaved(seeds[base + 1]); A10_E = v.x; A10_O = v.y; }
+    if (2 < n_lanes) { uint2 v = to_interleaved(seeds[base + 2]); A20_E = v.x; A20_O = v.y; }
+    if (3 < n_lanes) { uint2 v = to_interleaved(seeds[base + 3]); A30_E = v.x; A30_O = v.y; }
+    if (4 < n_lanes) { uint2 v = to_interleaved(seeds[base + 4]); A40_E = v.x; A40_O = v.y; }
+
+    if (5 < n_lanes) { uint2 v = to_interleaved(seeds[base + 5]); A01_E = v.x; A01_O = v.y; }
+    if (6 < n_lanes) { uint2 v = to_interleaved(seeds[base + 6]); A11_E = v.x; A11_O = v.y; }
+    if (7 < n_lanes) { uint2 v = to_interleaved(seeds[base + 7]); A21_E = v.x; A21_O = v.y; }
+    if (8 < n_lanes) { uint2 v = to_interleaved(seeds[base + 8]); A31_E = v.x; A31_O = v.y; }
+    if (9 < n_lanes) { uint2 v = to_interleaved(seeds[base + 9]); A41_E = v.x; A41_O = v.y; }
+
+    if (10 < n_lanes) { uint2 v = to_interleaved(seeds[base + 10]); A02_E = v.x; A02_O = v.y; }
+    if (11 < n_lanes) { uint2 v = to_interleaved(seeds[base + 11]); A12_E = v.x; A12_O = v.y; }
+    if (12 < n_lanes) { uint2 v = to_interleaved(seeds[base + 12]); A22_E = v.x; A22_O = v.y; }
+    if (13 < n_lanes) { uint2 v = to_interleaved(seeds[base + 13]); A32_E = v.x; A32_O = v.y; }
+    if (14 < n_lanes) { uint2 v = to_interleaved(seeds[base + 14]); A42_E = v.x; A42_O = v.y; }
+
+    if (15 < n_lanes) { uint2 v = to_interleaved(seeds[base + 15]); A03_E = v.x; A03_O = v.y; }
+
+    constexpr uint2 PAD06 = to_interleaved(0x06ul);
+    uint pad06_E = PAD06.x;
+    uint pad06_O = PAD06.y;
+
+    constexpr uint2 PAD16_16 = to_interleaved(0x8000000000000006ul);
+    constexpr uint2 PAD16_OTHERS = to_interleaved(0x8000000000000000ul);
+    uint pad16_E = select(PAD16_OTHERS.x, PAD16_16.x, n_lanes == 16);
+    uint pad16_O = select(PAD16_OTHERS.y, PAD16_16.y, n_lanes == 16);
+
+    bool c00 = n_lanes > 0;  uint P00_E = (n_lanes == 0)  ? pad06_E : 0u; uint P00_O = (n_lanes == 0)  ? pad06_O : 0u;
+    bool c10 = n_lanes > 1;  uint P10_E = (n_lanes == 1)  ? pad06_E : 0u; uint P10_O = (n_lanes == 1)  ? pad06_O : 0u;
+    bool c20 = n_lanes > 2;  uint P20_E = (n_lanes == 2)  ? pad06_E : 0u; uint P20_O = (n_lanes == 2)  ? pad06_O : 0u;
+    bool c30 = n_lanes > 3;  uint P30_E = (n_lanes == 3)  ? pad06_E : 0u; uint P30_O = (n_lanes == 3)  ? pad06_O : 0u;
+    bool c40 = n_lanes > 4;  uint P40_E = (n_lanes == 4)  ? pad06_E : 0u; uint P40_O = (n_lanes == 4)  ? pad06_O : 0u;
+
+    bool c01 = n_lanes > 5;  uint P01_E = (n_lanes == 5)  ? pad06_E : 0u; uint P01_O = (n_lanes == 5)  ? pad06_O : 0u;
+    bool c11 = n_lanes > 6;  uint P11_E = (n_lanes == 6)  ? pad06_E : 0u; uint P11_O = (n_lanes == 6)  ? pad06_O : 0u;
+    bool c21 = n_lanes > 7;  uint P21_E = (n_lanes == 7)  ? pad06_E : 0u; uint P21_O = (n_lanes == 7)  ? pad06_O : 0u;
+    bool c31 = n_lanes > 8;  uint P31_E = (n_lanes == 8)  ? pad06_E : 0u; uint P31_O = (n_lanes == 8)  ? pad06_O : 0u;
+    bool c41 = n_lanes > 9;  uint P41_E = (n_lanes == 9)  ? pad06_E : 0u; uint P41_O = (n_lanes == 9)  ? pad06_O : 0u;
+
+    bool c02 = n_lanes > 10; uint P02_E = (n_lanes == 10) ? pad06_E : 0u; uint P02_O = (n_lanes == 10) ? pad06_O : 0u;
+    bool c12 = n_lanes > 11; uint P12_E = (n_lanes == 11) ? pad06_E : 0u; uint P12_O = (n_lanes == 11) ? pad06_O : 0u;
+    bool c22 = n_lanes > 12; uint P22_E = (n_lanes == 12) ? pad06_E : 0u; uint P22_O = (n_lanes == 12) ? pad06_O : 0u;
+    bool c32 = n_lanes > 13; uint P32_E = (n_lanes == 13) ? pad06_E : 0u; uint P32_O = (n_lanes == 13) ? pad06_O : 0u;
+    bool c42 = n_lanes > 14; uint P42_E = (n_lanes == 14) ? pad06_E : 0u; uint P42_O = (n_lanes == 14) ? pad06_O : 0u;
+
+    bool c03 = n_lanes > 15; uint P03_E = (n_lanes == 15) ? pad06_E : 0u; uint P03_O = (n_lanes == 15) ? pad06_O : 0u;
+
+    for (uint step = 0u; step < w; ++step) {
+        
+        A00_E = select(P00_E, A00_E, c00); A00_O = select(P00_O, A00_O, c00);
+        A10_E = select(P10_E, A10_E, c10); A10_O = select(P10_O, A10_O, c10);
+        A20_E = select(P20_E, A20_E, c20); A20_O = select(P20_O, A20_O, c20);
+        A30_E = select(P30_E, A30_E, c30); A30_O = select(P30_O, A30_O, c30);
+        A40_E = select(P40_E, A40_E, c40); A40_O = select(P40_O, A40_O, c40);
+
+        A01_E = select(P01_E, A01_E, c01); A01_O = select(P01_O, A01_O, c01);
+        A11_E = select(P11_E, A11_E, c11); A11_O = select(P11_O, A11_O, c11);
+        A21_E = select(P21_E, A21_E, c21); A21_O = select(P21_O, A21_O, c21);
+        A31_E = select(P31_E, A31_E, c31); A31_O = select(P31_O, A31_O, c31);
+        A41_E = select(P41_E, A41_E, c41); A41_O = select(P41_O, A41_O, c41);
+
+        A02_E = select(P02_E, A02_E, c02); A02_O = select(P02_O, A02_O, c02);
+        A12_E = select(P12_E, A12_E, c12); A12_O = select(P12_O, A12_O, c12);
+        A22_E = select(P22_E, A22_E, c22); A22_O = select(P22_O, A22_O, c22);
+        A32_E = select(P32_E, A32_E, c32); A32_O = select(P32_O, A32_O, c32);
+        A42_E = select(P42_E, A42_E, c42); A42_O = select(P42_O, A42_O, c42);
+
+        A03_E = select(P03_E, A03_E, c03); A03_O = select(P03_O, A03_O, c03);
+
+        A13_E = pad16_E; A13_O = pad16_O;
+        
+        A23_E = 0; A23_O = 0;
+        A33_E = 0; A33_O = 0;
+        A43_E = 0; A43_O = 0;
+        A04_E = 0; A04_O = 0;
+        A14_E = 0; A14_O = 0;
+        A24_E = 0; A24_O = 0;
+        A34_E = 0; A34_O = 0;
+        A44_E = 0; A44_O = 0;
+
+        K_ROUND(0x0000000000000001ul);
+        K_ROUND(0x0000000000008082ul);
+        K_ROUND(0x800000000000808Aul);
+        K_ROUND(0x8000000080008000ul);
+        K_ROUND(0x000000000000808Bul);
+        K_ROUND(0x0000000080000001ul);
+        K_ROUND(0x8000000080008081ul);
+        K_ROUND(0x8000000000008009ul);
+        K_ROUND(0x000000000000008Aul);
+        K_ROUND(0x0000000000000088ul);
+        K_ROUND(0x0000000080008009ul);
+        K_ROUND(0x000000008000000Aul);
+        K_ROUND(0x000000008000808Bul);
+        K_ROUND(0x800000000000008Bul);
+        K_ROUND(0x8000000000008089ul);
+        K_ROUND(0x8000000000008003ul);
+        K_ROUND(0x8000000000008002ul);
+        K_ROUND(0x8000000000000080ul);
+        K_ROUND(0x000000000000800Aul);
+        K_ROUND(0x800000008000000Aul);
+        K_ROUND(0x8000000080008081ul);
+        K_ROUND(0x8000000000008080ul);
+        K_ROUND(0x0000000080000001ul);
+        K_ROUND(0x8000000080008008ul);
+    }
+
+    if (0 < n_lanes) tips[base + 0] = from_interleaved(A00_E, A00_O);
+    if (1 < n_lanes) tips[base + 1] = from_interleaved(A10_E, A10_O);
+    if (2 < n_lanes) tips[base + 2] = from_interleaved(A20_E, A20_O);
+    if (3 < n_lanes) tips[base + 3] = from_interleaved(A30_E, A30_O);
+    if (4 < n_lanes) tips[base + 4] = from_interleaved(A40_E, A40_O);
+
+    if (5 < n_lanes) tips[base + 5] = from_interleaved(A01_E, A01_O);
+    if (6 < n_lanes) tips[base + 6] = from_interleaved(A11_E, A11_O);
+    if (7 < n_lanes) tips[base + 7] = from_interleaved(A21_E, A21_O);
+    if (8 < n_lanes) tips[base + 8] = from_interleaved(A31_E, A31_O);
+    if (9 < n_lanes) tips[base + 9] = from_interleaved(A41_E, A41_O);
+
+    if (10 < n_lanes) tips[base + 10] = from_interleaved(A02_E, A02_O);
+    if (11 < n_lanes) tips[base + 11] = from_interleaved(A12_E, A12_O);
+    if (12 < n_lanes) tips[base + 12] = from_interleaved(A22_E, A22_O);
+    if (13 < n_lanes) tips[base + 13] = from_interleaved(A32_E, A32_O);
+    if (14 < n_lanes) tips[base + 14] = from_interleaved(A42_E, A42_O);
+
+    if (15 < n_lanes) tips[base + 15] = from_interleaved(A03_E, A03_O);
+}
+```
+
+Incumbent result:
+          w16_C64K: correct, 4.50 ms, 866.1 Gbitops/s (u64) (77.0% of 1125 Gops/s (u64 bitop, est))
+          w64_C64K: correct, 17.19 ms, 907.7 Gbitops/s (u64) (80.7% of 1125 Gops/s (u64 bitop, est))
+         w256_C64K: correct, 68.86 ms, 906.3 Gbitops/s (u64) (80.6% of 1125 Gops/s (u64 bitop, est))
+  score (gmean of fraction): 0.7939
+
+## History
+
+- iter  3: compile=OK | correct=False | score=N/A
+- iter  4: compile=OK | correct=True | score=0.6089068857986767
+- iter  5: compile=OK | correct=True | score=0.7853289798086907
+- iter  6: compile=OK | correct=True | score=0.7677162525388368
+- iter  7: compile=OK | correct=True | score=0.6065688367450467
+- iter  8: compile=OK | correct=True | score=0.7770153272833022
+- iter  9: compile=OK | correct=True | score=0.7939304062481057
+- iter 10: compile=FAIL | correct=False | score=N/A
+
+## Instructions
+
+Write an improved Metal kernel. Address the failure mode in the
+previous attempt (if any), then push beyond the incumbent. Output ONE
+fenced ```metal``` code block. Preserve kernel name(s) and buffer
+indices.

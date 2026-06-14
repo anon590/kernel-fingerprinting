@@ -1,0 +1,18 @@
+{
+  "task": "kyber_ntt",
+  "redactions": [
+    {
+      "find": "(modulus; 3329 or 8380417)",
+      "replace": "(modulus; bound at runtime, fits in 32 bits)",
+      "note": "removes Dilithium held-out modulus from seed comment",
+      "n_matches": 1,
+      "where": [
+        "seed"
+      ]
+    }
+  ],
+  "denylist": [
+    "8380417",
+    "Dilithium"
+  ]
+}

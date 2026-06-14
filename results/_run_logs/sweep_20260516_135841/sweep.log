@@ -1,0 +1,6 @@
+=== STARTING 01_gemini_keccak_f1600_batch 2026-05-16T11:58:59Z ===
+    cmd: uv run run_benchmark.py --task keccak_f1600_batch --model gemini-3.1-pro-preview --iterations 15
+=== FINISHED 01_gemini_keccak_f1600_batch rc=0 dt=3940s 2026-05-16T13:04:39Z ===
+=== STARTING 02_gemini_merkle_build 2026-05-16T13:04:39Z ===
+    cmd: uv run run_benchmark.py --task merkle_build --model gemini-3.1-pro-preview --iterations 10
+RUN_02_FINISHED 2026-05-16T13:48:52Z

@@ -1,0 +1,7 @@
+{
+  "compile_ok": false,
+  "correct": false,
+  "score": null,
+  "fail_reason": "compile error: Error Domain=MTLLibraryErrorDomain Code=3 \"program_source:4:17: error: program scope variable must reside in constant address space\nconstexpr ulong KECCAK_RC[24] = {\n                ^\nprogram_source:15:16: error: program scope variable must reside in constant address space\nconstexpr uint KECCAK_RHO[25] = {\n               ^\n\" UserInfo={NSLocalizedDescription=program_source:4:17: error: program scope variable must reside in constant address space\nconstexpr ulong KECCAK_RC[24] = {\n                ^\nprogram_source:15:16: error: program scope variable must reside in constant address space\nconstexpr uint KECCAK_RHO[25] = {\n               ^\n}",
+  "sizes": []
+}

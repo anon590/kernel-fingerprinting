@@ -1,0 +1,132 @@
+{
+  "task": "montgomery_msm",
+  "model": "claude-opus-4-7",
+  "chip": "Apple M1 Pro",
+  "n_iterations": 10,
+  "seed_score": 0.0039469233524904185,
+  "best_score": 0.010642882225853382,
+  "improvement": 2.6965008629159133,
+  "history": [
+    {
+      "iteration": 0,
+      "role": "seed",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0039469233524904185,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/00_seed.metal",
+      "elapsed_s": 81.039067029953,
+      "is_new_best": true
+    },
+    {
+      "iteration": 1,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.007485626493860429,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/01_candidate.metal",
+      "elapsed_s": 123.94324207305908,
+      "is_new_best": true
+    },
+    {
+      "iteration": 2,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0011487006695191965,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/02_candidate.metal",
+      "elapsed_s": 338.42080521583557,
+      "is_new_best": false
+    },
+    {
+      "iteration": 3,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.010642882225853382,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/03_candidate.metal",
+      "elapsed_s": 103.01895093917847,
+      "is_new_best": true
+    },
+    {
+      "iteration": 4,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.003968420959799621,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/04_candidate.metal",
+      "elapsed_s": 165.89056372642517,
+      "is_new_best": false
+    },
+    {
+      "iteration": 5,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.003955388150359739,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/05_candidate.metal",
+      "elapsed_s": 167.29864597320557,
+      "is_new_best": false
+    },
+    {
+      "iteration": 6,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.0059781477821268855,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/06_candidate.metal",
+      "elapsed_s": 109.83404850959778,
+      "is_new_best": false
+    },
+    {
+      "iteration": 7,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.005233363220410666,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/07_candidate.metal",
+      "elapsed_s": 134.37013697624207,
+      "is_new_best": false
+    },
+    {
+      "iteration": 8,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.005139700990575784,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/08_candidate.metal",
+      "elapsed_s": 141.92383098602295,
+      "is_new_best": false
+    },
+    {
+      "iteration": 9,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.005474621166239921,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/09_candidate.metal",
+      "elapsed_s": 130.65150117874146,
+      "is_new_best": false
+    },
+    {
+      "iteration": 10,
+      "role": "candidate",
+      "compile_ok": true,
+      "correct": true,
+      "score": 0.008067799621826134,
+      "fail_reason": null,
+      "source_path": "results/montgomery_msm_claude-opus-4-7_20260516_114712/10_candidate.metal",
+      "elapsed_s": 106.71215224266052,
+      "is_new_best": false
+    }
+  ]
+}

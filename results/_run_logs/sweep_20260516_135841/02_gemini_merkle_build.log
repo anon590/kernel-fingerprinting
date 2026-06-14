@@ -1,0 +1,93 @@
+
+=== Metal kernel evolution: task=merkle_build ===
+  model: gemini-3.1-pro-preview
+  chip:  Apple M1 Pro (peak 4500 GFLOPS fp32, 53 Gops/s int64 mul [est], 200 GB/s DRAM)
+  timing: n_warmup=3, n_measure=10, n_reps=3
+  output: results/merkle_build_gemini-3.1-pro-preview_20260516_150439
+
+[seed] Evaluating seed kernel...
+  seed score: 0.3042  (1.2s)
+
+--- iteration 1/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 282.4s; evaluating...
+  score = 0.3271 (seed = 0.3042, best = 0.3042)
+             a2_N64K:    1.68 ms,    12.9 Gmodmul/s (int64) (24.2%)  [reps 1.65-2.12 ms]
+            a2_N256K:    4.56 ms,    19.0 Gmodmul/s (int64) (35.7%)  [reps 4.55-4.57 ms]
+              a2_N1M:   16.03 ms,    21.6 Gmodmul/s (int64) (40.6%)  [reps 16.03-16.05 ms]
+  NEW INCUMBENT
+
+--- iteration 2/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 258.1s; evaluating...
+  score = 0.4097 (seed = 0.3042, best = 0.3271)
+             a2_N64K:    1.38 ms,    15.7 Gmodmul/s (int64) (29.4%)  [reps 1.38-1.78 ms]
+            a2_N256K:    3.62 ms,    23.9 Gmodmul/s (int64) (44.9%)  [reps 3.62-3.63 ms]
+              a2_N1M:   12.50 ms,    27.8 Gmodmul/s (int64) (52.0%)  [reps 12.45-12.56 ms]
+  NEW INCUMBENT
+
+--- iteration 3/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 289.4s; evaluating...
+  score = 0.3999 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    1.44 ms,    15.1 Gmodmul/s (int64) (28.3%)  [reps 1.42-1.44 ms]
+            a2_N256K:    3.72 ms,    23.4 Gmodmul/s (int64) (43.8%)  [reps 3.70-3.72 ms]
+              a2_N1M:   12.60 ms,    27.5 Gmodmul/s (int64) (51.6%)  [reps 12.60-12.63 ms]
+
+--- iteration 4/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 267.2s; evaluating...
+  score = 0.3644 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    1.92 ms,    11.3 Gmodmul/s (int64) (21.2%)  [reps 1.91-1.97 ms]
+            a2_N256K:    3.96 ms,    21.9 Gmodmul/s (int64) (41.1%)  [reps 3.95-4.00 ms]
+              a2_N1M:   11.72 ms,    29.6 Gmodmul/s (int64) (55.5%)  [reps 11.70-11.72 ms]
+
+--- iteration 5/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 267.4s; evaluating...
+  score = 0.3082 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    2.31 ms,     9.4 Gmodmul/s (int64) (17.6%)  [reps 2.23-2.32 ms]
+            a2_N256K:    4.60 ms,    18.9 Gmodmul/s (int64) (35.4%)  [reps 4.56-4.69 ms]
+              a2_N1M:   13.81 ms,    25.1 Gmodmul/s (int64) (47.1%)  [reps 13.81-13.89 ms]
+
+--- iteration 6/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 236.1s; evaluating...
+  score = 0.3909 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    1.62 ms,    13.4 Gmodmul/s (int64) (25.1%)  [reps 1.44-1.81 ms]
+            a2_N256K:    3.62 ms,    24.0 Gmodmul/s (int64) (45.0%)  [reps 3.62-3.62 ms]
+              a2_N1M:   12.28 ms,    28.3 Gmodmul/s (int64) (53.0%)  [reps 12.25-12.29 ms]
+
+--- iteration 7/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 287.1s; evaluating...
+  score = 0.3811 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    1.71 ms,    12.7 Gmodmul/s (int64) (23.8%)  [reps 1.49-1.77 ms]
+            a2_N256K:    3.67 ms,    23.6 Gmodmul/s (int64) (44.3%)  [reps 3.64-3.67 ms]
+              a2_N1M:   12.40 ms,    28.0 Gmodmul/s (int64) (52.5%)  [reps 12.35-12.40 ms]
+
+--- iteration 8/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 224.5s; evaluating...
+  score = 0.3947 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    1.45 ms,    15.0 Gmodmul/s (int64) (28.1%)  [reps 1.45-1.47 ms]
+            a2_N256K:    3.76 ms,    23.0 Gmodmul/s (int64) (43.2%)  [reps 3.76-3.77 ms]
+              a2_N1M:   12.83 ms,    27.0 Gmodmul/s (int64) (50.7%)  [reps 12.78-12.85 ms]
+
+--- iteration 9/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 239.3s; evaluating...
+  score = 0.3790 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    1.52 ms,    14.2 Gmodmul/s (int64) (26.7%)  [reps 1.50-1.91 ms]
+            a2_N256K:    3.89 ms,    22.3 Gmodmul/s (int64) (41.8%)  [reps 3.89-3.90 ms]
+              a2_N1M:   13.31 ms,    26.1 Gmodmul/s (int64) (48.9%)  [reps 13.30-13.31 ms]
+
+--- iteration 10/10 ---
+Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+  generated in 264.9s; evaluating...
+  score = 0.3871 (seed = 0.3042, best = 0.4097)
+             a2_N64K:    1.48 ms,    14.6 Gmodmul/s (int64) (27.4%)  [reps 1.47-1.88 ms]
+            a2_N256K:    3.87 ms,    22.4 Gmodmul/s (int64) (42.0%)  [reps 3.81-3.92 ms]
+              a2_N1M:   12.93 ms,    26.8 Gmodmul/s (int64) (50.3%)  [reps 12.92-13.25 ms]
+
+=== done. seed=0.3042, best=0.4097, output=results/merkle_build_gemini-3.1-pro-preview_20260516_150439 ===
